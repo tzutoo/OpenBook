@@ -11,6 +11,7 @@ use crate::workspace::{
     PaneRenderer, WorkspaceBehavior, DEFAULT_LAYOUT_PROFILE_NAME, LAYOUT_PREFS_KEY,
     LAYOUT_STORE_V1_KEY, LAYOUT_STORE_V2_KEY,
 };
+
 use crate::{spawn_ticker_task, spawn_ws_task};
 use crate::signal::{SignalExtractor, SignalConfig, SignalSample};
 use crate::strategy::{
@@ -354,7 +355,7 @@ pub struct OrderBookApp {
     login_secret_input: String,
     login_error: Option<String>,
     login_connecting: bool,
-    binance_client: Option<crate::execution::BinanceTestnetClient>,
+    binance_client: Option<Arc<crate::execution::BinanceTestnetClient>>,
     show_api_log: bool,
 }
 
@@ -571,6 +572,16 @@ impl OrderBookApp {
             ..StratConfig::default()
         };
         self.strategy_engine = StrategyEngine::new(strat_config, self.initial_equity);
+        // Re-attach Binance client and sync position for new symbol
+        if let Some(ref client) = self.binance_client {
+            self.strategy_engine.set_binance_client(Arc::clone(client));
+            self.strategy_engine.sync_from_exchange(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            );
+        }
         self.signal_aggregator = SignalBarAggregator::new(30_000);
         self.last_bar = None;
         self.last_signal = Signal::Hold;
@@ -4265,23 +4276,28 @@ impl OrderBookApp {
                             let client = crate::execution::BinanceTestnetClient::new(key, secret);
                             match client.test_connection() {
                                 Ok(_) => {
+                                    let client = Arc::new(client);
+                                    // Sync account info after login
+                                    let balance = client.get_balance().unwrap_or(10_000.0);
+                                    self.initial_equity = balance;
+                                    self.strategy_engine = crate::strategy::StrategyEngine::new(
+                                        crate::strategy::StrategyConfig {
+                                            symbol: self.active_symbol.clone(),
+                                            ..Default::default()
+                                        },
+                                        balance,
+                                    );
+                                    self.strategy_engine.set_binance_client(Arc::clone(&client));
+                                    self.strategy_engine.sync_from_exchange(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0),
+                                    );
+                                    self.equity_history.clear();
+                                    self.equity_history.push((0, balance));
                                     self.binance_client = Some(client);
                                     self.logged_in = true;
-                                    // Sync account info after login
-                                    if let Some(ref bc) = self.binance_client {
-                                        if let Ok(balance) = bc.get_balance() {
-                                            self.initial_equity = balance;
-                                            self.strategy_engine = crate::strategy::StrategyEngine::new(
-                                                crate::strategy::StrategyConfig {
-                                                    symbol: self.active_symbol.clone(),
-                                                    ..Default::default()
-                                                },
-                                                balance,
-                                            );
-                                            self.equity_history.clear();
-                                            self.equity_history.push((0, balance));
-                                        }
-                                    }
                                 }
                                 Err(e) => {
                                     self.login_error = Some(e);

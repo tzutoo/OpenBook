@@ -54,10 +54,12 @@
 //! println!("{:#?}", report);
 //! ```
 
+use crate::execution::BinanceTestnetClient;
 use crate::signal::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::Arc;
 
 // =============================================================================
 // AggregatedBar & SignalBarAggregator
@@ -635,6 +637,9 @@ pub struct StrategyEngine {
 
     // Bar tracking
     last_bar: Option<AggregatedBar>,
+
+    // Binance execution
+    binance_client: Option<Arc<BinanceTestnetClient>>,
 }
 
 impl StrategyEngine {
@@ -657,6 +662,54 @@ impl StrategyEngine {
             last_exit_time_ms: 0,
             session_active: true,
             last_bar: None,
+            binance_client: None,
+        }
+    }
+
+    /// Set the Binance execution client. When set, all open/close operations
+    /// will place real orders on Binance Demo before updating internal state.
+    /// If the Binance order fails, the internal state is not updated.
+    pub fn set_binance_client(&mut self, client: Arc<BinanceTestnetClient>) {
+        self.binance_client = Some(client);
+    }
+
+    /// Sync the current position and equity from the Binance exchange.
+    /// Call this after login or symbol switch to reconcile internal state.
+    pub fn sync_from_exchange(&mut self, now_ms: u64) {
+        let client = match &self.binance_client {
+            Some(c) => c,
+            None => return,
+        };
+
+        let symbol = self.config.symbol.to_uppercase();
+
+        // Sync balance
+        if let Ok(balance) = client.get_balance() {
+            if balance > 0.0 {
+                self.equity = balance;
+            }
+        }
+
+        // Sync position
+        if let Ok(Some(pos)) = client.get_position(&symbol) {
+            if pos.position_amt.abs() > 0.0 {
+                let state = if pos.position_amt > 0.0 {
+                    PositionState::Long
+                } else {
+                    PositionState::Short
+                };
+                self.position = Position {
+                    state,
+                    entry_price: pos.entry_price,
+                    entry_time_ms: now_ms, // We don't know exact entry time from exchange
+                    quantity: pos.position_amt.abs(),
+                    unrealized_pnl: pos.unrealized_pnl,
+                    max_favorable: 0.0,
+                    max_adverse: 0.0,
+                };
+            } else {
+                self.position = Position::flat();
+            }
         }
     }
 
@@ -687,20 +740,20 @@ impl StrategyEngine {
             if exit_signal != Signal::Hold {
                 // Determine exit reason by re-checking conditions
                 let reason = self.determine_exit_reason(bar);
-                self.close_position(bar.close_price, bar.bar_end_ms, reason);
-                return exit_signal;
+                let closed = self.close_position(bar.close_price, bar.bar_end_ms, reason);
+                return if closed { exit_signal } else { Signal::Hold };
             }
             return Signal::Hold;
         }
 
         // If flat, check entry conditions
         let entry_signal = self.check_entry(Self::compute_score(bar), bar);
-        match entry_signal {
+        let opened = match entry_signal {
             Signal::GoLong => self.open_position(Side::Buy, bar.close_price, bar.bar_end_ms),
             Signal::GoShort => self.open_position(Side::Sell, bar.close_price, bar.bar_end_ms),
-            _ => {}
-        }
-        entry_signal
+            _ => true,
+        };
+        if opened { entry_signal } else { Signal::Hold }
     }
 
     /// Compute the composite score from an aggregated bar.
@@ -937,10 +990,24 @@ impl StrategyEngine {
     ///
     /// Calculates position size based on risk config and opens the position
     /// at the specified price and time.
-    fn open_position(&mut self, side: Side, price: f64, time_ms: u64) {
+    /// Returns `true` if the position was opened successfully.
+    /// Returns `false` if the Binance order failed (position not opened).
+    fn open_position(&mut self, side: Side, price: f64, time_ms: u64) -> bool {
         let quantity = self.calculate_position_size(price);
         if quantity <= 0.0 {
-            return;
+            return false;
+        }
+
+        // If Binance client is set, place real order first
+        if let Some(ref client) = self.binance_client {
+            let binance_side = match side {
+                Side::Buy => "BUY",
+                Side::Sell => "SELL",
+            };
+            let symbol = self.config.symbol.to_uppercase();
+            if client.place_market_order(&symbol, binance_side, quantity).is_err() {
+                return false;
+            }
         }
 
         let state = match side {
@@ -957,15 +1024,31 @@ impl StrategyEngine {
             max_favorable: 0.0,
             max_adverse: 0.0,
         };
+        true
     }
 
     /// Close the current position and record the trade.
     ///
-    /// Updates equity, daily P&L, consecutive loss tracking, and appends
-    /// a [`TradeRecord`] to the history.
-    fn close_position(&mut self, exit_price: f64, time_ms: u64, reason: &str) {
+    /// Returns `true` if the position was closed successfully.
+    /// Returns `false` if the Binance order failed (position not closed).
+    fn close_position(&mut self, exit_price: f64, time_ms: u64, reason: &str) -> bool {
         if self.position.is_flat() {
-            return;
+            return false;
+        }
+
+        let quantity = self.position.quantity;
+
+        // If Binance client is set, place real order first (opposite side to close)
+        if let Some(ref client) = self.binance_client {
+            let binance_side = match self.position.state {
+                PositionState::Long => "SELL",
+                PositionState::Short => "BUY",
+                PositionState::Flat => return false,
+            };
+            let symbol = self.config.symbol.to_uppercase();
+            if client.place_market_order(&symbol, binance_side, quantity).is_err() {
+                return false;
+            }
         }
 
         let entry_price = self.position.entry_price;
@@ -991,7 +1074,7 @@ impl StrategyEngine {
                 };
                 (pnl, pnl_pct, Side::Sell)
             }
-            PositionState::Flat => return,
+            PositionState::Flat => return false,
         };
 
         let hold_duration_ms = time_ms.saturating_sub(entry_time_ms);
@@ -1025,6 +1108,7 @@ impl StrategyEngine {
         self.last_exit_time_ms = time_ms;
         self.trade_history.push(trade);
         self.position = Position::flat();
+        true
     }
 
     /// Calculate position size based on risk configuration.
