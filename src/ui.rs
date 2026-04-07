@@ -12,7 +12,7 @@ use crate::workspace::{
     LAYOUT_STORE_V1_KEY, LAYOUT_STORE_V2_KEY,
 };
 use crate::{spawn_ticker_task, spawn_ws_task};
-use crate::signal::{SignalExtractor, SignalConfig};
+use crate::signal::{SignalExtractor, SignalConfig, SignalSample};
 use crate::strategy::{
     AggregatedBar, PerformanceReport, PositionState, Signal, SignalBarAggregator,
     StrategyConfig as StratConfig, StrategyEngine,
@@ -345,6 +345,7 @@ pub struct OrderBookApp {
     equity_history: Vec<(u64, f64)>,  // (timestamp_ms, equity)
     last_bar: Option<AggregatedBar>,
     last_signal: Signal,
+    last_instant_score: f64,
     _signal_log_scroll: f32,
     _trade_log_scroll: f32,
 }
@@ -521,13 +522,14 @@ impl OrderBookApp {
             perf_stats: PerfStats::new(),
             strategy_enabled: true,
             signal_extractor: Some(signal_extractor),
-            signal_aggregator: SignalBarAggregator::new(60_000),
+            signal_aggregator: SignalBarAggregator::new(30_000),
             strategy_engine,
             initial_equity,
             last_sample_time: std::time::Instant::now(),
             equity_history: vec![(0, initial_equity)],
             last_bar: None,
             last_signal: Signal::Hold,
+            last_instant_score: 0.0,
             _signal_log_scroll: 0.0,
             _trade_log_scroll: 0.0,
         }
@@ -554,9 +556,10 @@ impl OrderBookApp {
             ..StratConfig::default()
         };
         self.strategy_engine = StrategyEngine::new(strat_config, self.initial_equity);
-        self.signal_aggregator = SignalBarAggregator::new(60_000);
+        self.signal_aggregator = SignalBarAggregator::new(30_000);
         self.last_bar = None;
         self.last_signal = Signal::Hold;
+        self.last_instant_score = 0.0;
         self.equity_history.clear();
         self.equity_history.push((0, self.initial_equity));
         let sig_config = SignalConfig {
@@ -806,6 +809,9 @@ impl eframe::App for OrderBookApp {
                     
                     let sample = extractor.sample();
                     
+                    // Compute instant score from raw sample (updates every 1s)
+                    self.last_instant_score = Self::compute_instant_score(&sample);
+                    
                     if let Some(bar) = self.signal_aggregator.push(sample.clone()) {
                         self.last_bar = Some(bar.clone());
                         let prev_trade_count = self.strategy_engine.trade_history().len();
@@ -820,9 +826,9 @@ impl eframe::App for OrderBookApp {
                         // Update equity history
                         let equity = self.strategy_engine.equity();
                         self.equity_history.push((bar.bar_end_ms, equity));
-                        // Keep last 1440 points (24h at 1-min bars)
-                        if self.equity_history.len() > 1440 {
-                            self.equity_history.drain(..self.equity_history.len() - 1440);
+                        // Keep last 2880 points (24h at 30s bars)
+                        if self.equity_history.len() > 2880 {
+                            self.equity_history.drain(..self.equity_history.len() - 2880);
                         }
                     }
                 }
@@ -1671,6 +1677,22 @@ impl eframe::App for OrderBookApp {
 }
 
 impl OrderBookApp {
+    fn compute_instant_score(sample: &SignalSample) -> f64 {
+        let absorption_direction = if sample.absorption_score > 0.7 && sample.fk_net_direction < 0.0 {
+            sample.absorption_score
+        } else if sample.absorption_score > 0.7 && sample.fk_net_direction > 0.0 {
+            -sample.absorption_score
+        } else {
+            0.0
+        };
+        let buy_volume_normalized = (sample.buy_volume_pct_1s - 50.0) / 50.0;
+        sample.fk_net_direction * 0.30
+            + sample.aggression_shift * 0.25
+            + sample.ob_imbalance * 0.15
+            + absorption_direction * 0.15
+            + buy_volume_normalized * 0.15
+    }
+
     fn snap_price_to_bin(price: f64, bin_width: f64) -> f64 {
         if bin_width > 0.0 {
             (price / bin_width).round() * bin_width
@@ -3513,7 +3535,7 @@ impl OrderBookApp {
             ui.separator();
             ui.add_space(4.0);
             
-            // Composite score
+            // Composite score (30s bar — drives decisions)
             let score = self.last_bar.as_ref()
                 .map(|b| StrategyEngine::compute_score(b))
                 .unwrap_or(0.0);
@@ -3526,9 +3548,25 @@ impl OrderBookApp {
             };
             
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("SCORE").color(egui::Color32::GRAY).size(11.0));
+                ui.label(egui::RichText::new("SCORE (30s)").color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(format!("{score:+.3}")).color(score_color).strong().size(16.0));
+                });
+            });
+            
+            // Instant score (1s — live preview, volatile)
+            let inst = self.last_instant_score;
+            let inst_color = if inst > 0.1 {
+                BID_COLOR
+            } else if inst < -0.1 {
+                ASK_COLOR
+            } else {
+                egui::Color32::from_rgb(80, 85, 95)
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("LIVE (1s)").color(egui::Color32::from_rgb(80, 85, 95)).size(10.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{inst:+.3}")).color(inst_color).size(12.0));
                 });
             });
             
