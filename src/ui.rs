@@ -15,7 +15,7 @@ use crate::workspace::{
 use crate::{spawn_ticker_task, spawn_ws_task};
 use crate::signal::{SignalExtractor, SignalConfig, SignalSample};
 use crate::strategy::{
-    AggregatedBar, PerformanceReport, PositionState, Signal, SignalBarAggregator,
+    AggregatedBar, PositionState, Signal, SignalBarAggregator,
     StrategyConfig as StratConfig, StrategyEngine,
 };
 use eframe::egui;
@@ -359,6 +359,8 @@ pub struct OrderBookApp {
     show_api_log: bool,
     /// Real trade history fetched from Binance testnet (oldest-first).
     binance_trades: Vec<crate::execution::UserTrade>,
+    /// Paired round-trip trades reconstructed from binance_trades.
+    round_trips: Vec<crate::execution::RoundTripTrade>,
 }
 
 struct AppPaneRenderer<'a> {
@@ -551,6 +553,7 @@ impl OrderBookApp {
             binance_client: None,
             show_api_log: false,
             binance_trades: Vec::new(),
+            round_trips: Vec::new(),
         }
     }
 
@@ -819,35 +822,35 @@ impl OrderBookApp {
                 self.binance_trades = trades;
             }
             Err(_) => {
-                // Error is already logged inside fetch_all_user_trades via signed_get
                 self.binance_trades.clear();
+                self.round_trips.clear();
+                self.equity_history.clear();
+                self.equity_history.push((0, self.initial_equity));
                 return;
             }
         }
 
-        // Rebuild equity curve from cumulative realized PnL.
-        // current_balance was already synced via get_balance() before this call.
-        // Walk backwards: balance_before_first = current - sum(all net PnL),
-        // then walk forwards to build the curve.
-        if self.binance_trades.is_empty() {
+        // Pair individual fills into round-trip trades (entry + exit = 1 record)
+        self.round_trips = crate::execution::pair_round_trips(&self.binance_trades);
+
+        if self.round_trips.is_empty() {
             self.equity_history.clear();
             self.equity_history.push((0, self.initial_equity));
             return;
         }
 
-        // Binance returns commission as negative (e.g. "-0.078"), so add it to PnL
-        let total_net_pnl: f64 = self.binance_trades.iter()
-            .map(|t| t.realized_pnl + t.commission)
-            .sum();
-
+        // Rebuild equity curve from round-trip net PnL.
+        // Walk backwards: balance_before_first = current - sum(all net_pnl),
+        // then walk forwards to build the curve at each trade exit.
+        let total_net_pnl: f64 = self.round_trips.iter().map(|t| t.net_pnl).sum();
         let balance_before_first = self.initial_equity - total_net_pnl;
-        let first_trade_time = self.binance_trades.first().map(|t| t.time).unwrap_or(0);
+        let first_entry = self.round_trips.first().map(|t| t.entry_time_ms).unwrap_or(0);
 
-        let mut equity_history = vec![(first_trade_time.saturating_sub(1000), balance_before_first)];
+        let mut equity_history = vec![(first_entry.saturating_sub(1000), balance_before_first)];
         let mut running_equity = balance_before_first;
-        for trade in &self.binance_trades {
-            running_equity += trade.realized_pnl + trade.commission;
-            equity_history.push((trade.time, running_equity));
+        for trade in &self.round_trips {
+            running_equity += trade.net_pnl;
+            equity_history.push((trade.exit_time_ms, running_equity));
         }
 
         let now = std::time::SystemTime::now()
@@ -3829,14 +3832,44 @@ impl OrderBookApp {
             ui.separator();
             ui.add_space(4.0);
             
-            // Performance stats
-            let trades = self.strategy_engine.trade_history();
-            let report = PerformanceReport::from_trades(trades, self.initial_equity);
+            // Performance stats from real Binance round-trip trades
+            let total_trades = self.round_trips.len();
+            let winning_trades = self.round_trips.iter().filter(|t| t.net_pnl > 0.0).count();
+            let win_rate = if total_trades > 0 {
+                (winning_trades as f64 / total_trades as f64) * 100.0
+            } else {
+                0.0
+            };
+            let gross_profit: f64 = self.round_trips.iter().filter(|t| t.net_pnl > 0.0).map(|t| t.net_pnl).sum();
+            let gross_loss: f64 = self.round_trips.iter().filter(|t| t.net_pnl < 0.0).map(|t| t.net_pnl.abs()).sum();
+            let profit_factor = if gross_loss > 0.0 {
+                gross_profit / gross_loss
+            } else if gross_profit > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            };
+            // Max drawdown from round-trip equity curve
+            let mut max_dd_pct = 0.0f64;
+            let mut peak_equity = self.initial_equity - self.round_trips.iter().map(|t| t.net_pnl).sum::<f64>();
+            let mut running_eq = peak_equity;
+            for trade in &self.round_trips {
+                running_eq += trade.net_pnl;
+                if running_eq > peak_equity {
+                    peak_equity = running_eq;
+                }
+                if peak_equity > 0.0 {
+                    let dd = (peak_equity - running_eq) / peak_equity * 100.0;
+                    if dd > max_dd_pct {
+                        max_dd_pct = dd;
+                    }
+                }
+            }
             
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("TRADES").color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{}", report.total_trades))
+                    ui.label(egui::RichText::new(format!("{}", total_trades))
                         .color(egui::Color32::WHITE).size(12.0));
                 });
             });
@@ -3844,15 +3877,20 @@ impl OrderBookApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("WIN RATE").color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{:.1}%", report.win_rate))
-                        .color(if report.win_rate >= 50.0 { BID_COLOR } else { ASK_COLOR }).size(12.0));
+                    ui.label(egui::RichText::new(format!("{:.1}%", win_rate))
+                        .color(if win_rate >= 50.0 { BID_COLOR } else { ASK_COLOR }).size(12.0));
                 });
             });
             
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("PROFIT FACTOR").color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{:.2}", report.profit_factor))
+                    let pf_str = if profit_factor.is_infinite() {
+                        "∞".to_string()
+                    } else {
+                        format!("{:.2}", profit_factor)
+                    };
+                    ui.label(egui::RichText::new(pf_str)
                         .color(egui::Color32::WHITE).size(12.0));
                 });
             });
@@ -3860,7 +3898,7 @@ impl OrderBookApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("MAX DD").color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{:.2}%", report.max_drawdown_pct))
+                    ui.label(egui::RichText::new(format!("{:.2}%", max_dd_pct))
                         .color(ASK_COLOR).size(12.0));
                 });
             });
@@ -3980,7 +4018,7 @@ impl OrderBookApp {
                     return;
                 }
 
-                // Table header
+                // Table header — matches Binance userTrades format
                 ui.horizontal(|ui| {
                     let hc = egui::Color32::from_rgb(100, 110, 130);
                     ui.add_sized([30.0, 16.0], egui::Label::new(egui::RichText::new("ID").color(hc).size(10.0)));
@@ -4020,9 +4058,10 @@ impl OrderBookApp {
                         ui.add_sized([58.0, 16.0], egui::Label::new(
                             egui::RichText::new(format!("{:+.4}", trade.realized_pnl)).color(pnl_color).strong().size(10.0)));
 
-                        let comm_color = if trade.commission > 0.0 { ASK_COLOR } else { egui::Color32::GRAY };
+                        let comm_abs = trade.commission.abs();
+                        let comm_color = if comm_abs > 0.0 { ASK_COLOR } else { egui::Color32::GRAY };
                         ui.add_sized([50.0, 16.0], egui::Label::new(
-                            egui::RichText::new(format!("-{:.4}", trade.commission)).color(comm_color).size(10.0)));
+                            egui::RichText::new(format!("-{:.4}", comm_abs)).color(comm_color).size(10.0)));
 
                         let maker_text = if trade.maker { "Y" } else { "N" };
                         let maker_color = if trade.maker { BID_COLOR } else { egui::Color32::from_rgb(80, 85, 95) };

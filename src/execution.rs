@@ -128,6 +128,139 @@ pub struct UserTrade {
     pub maker: bool,
 }
 
+/// A completed round-trip trade, reconstructed from individual Binance fills.
+///
+/// Pairs consecutive fills into entry+exit. For example, BUY then SELL
+/// becomes one LONG trade with entry price, exit price, and net PnL.
+#[derive(Debug, Clone)]
+pub struct RoundTripTrade {
+    /// Sequential trade number (1-based).
+    pub id: u64,
+    /// Trade direction: "LONG" or "SHORT".
+    pub side: String,
+    /// Timestamp of the entry fill (epoch ms).
+    pub entry_time_ms: u64,
+    /// Timestamp of the exit fill (epoch ms).
+    pub exit_time_ms: u64,
+    /// Volume-weighted average entry price.
+    pub entry_price: f64,
+    /// Volume-weighted average exit price.
+    pub exit_price: f64,
+    /// Total quantity of the round-trip.
+    pub quantity: f64,
+    /// Sum of realizedPnl from all fills in this round-trip.
+    pub realized_pnl: f64,
+    /// Sum of commission from all fills in this round-trip (negative value from Binance).
+    pub commission: f64,
+    /// Net PnL = realized_pnl + commission.
+    pub net_pnl: f64,
+}
+
+/// Pair individual Binance fills into round-trip trades.
+///
+/// Walks through fills chronologically and detects when a position is fully closed.
+/// Handles partial fills, multiple entry fills at different prices, and partial closes.
+///
+/// # Algorithm
+/// - Track cumulative position quantity (positive = long, negative = short)
+/// - Track total cost basis for weighted average entry price
+/// - When position returns to zero, record a completed round-trip
+/// - Accumulate commission and realized_pnl across all fills in the trade
+pub fn pair_round_trips(fills: &[UserTrade]) -> Vec<RoundTripTrade> {
+    let mut round_trips = Vec::new();
+    let mut position_qty: f64 = 0.0;    // positive = long, negative = short
+    let mut position_cost: f64 = 0.0;   // total notional of current position
+    let mut entry_time_ms: u64 = 0;
+    let mut entry_side: &str = "";
+    let mut trade_commission: f64 = 0.0;
+    let mut trade_realized_pnl: f64 = 0.0;
+    let mut next_id: u64 = 1;
+
+    for fill in fills {
+        let fill_qty = if fill.side == "BUY" {
+            fill.qty
+        } else {
+            -fill.qty
+        };
+        let fill_notional = fill.price * fill.qty;
+
+        let prev_qty = position_qty;
+        position_qty += fill_qty;
+
+        if prev_qty.abs() < 1e-15 {
+            // Was flat — opening a new position
+            entry_time_ms = fill.time;
+            entry_side = if fill_qty > 0.0 { "LONG" } else { "SHORT" };
+            position_cost = fill_notional;
+            trade_commission = fill.commission;
+            trade_realized_pnl = fill.realized_pnl;
+        } else if prev_qty * position_qty > 0.0 {
+            // Same direction — adding to position
+            position_cost += fill_notional;
+            trade_commission += fill.commission;
+            trade_realized_pnl += fill.realized_pnl;
+        } else {
+            // Opposite direction — closing (partial or full)
+            trade_commission += fill.commission;
+            trade_realized_pnl += fill.realized_pnl;
+
+            let closed_qty = fill_qty.abs().min(prev_qty.abs());
+            let remaining_qty = prev_qty.abs() - closed_qty;
+
+            if remaining_qty.abs() < 1e-15 {
+                // Fully closed
+                let entry_price = if prev_qty.abs() > 1e-15 {
+                    position_cost / prev_qty.abs()
+                } else {
+                    fill.price
+                };
+                let exit_price = fill.price;
+                let quantity = prev_qty.abs();
+
+                // Commission is always a cost: testnet returns positive, mainnet returns negative.
+                // Use abs() to correctly subtract regardless of sign.
+                let net_pnl = trade_realized_pnl - trade_commission.abs();
+                round_trips.push(RoundTripTrade {
+                    id: next_id,
+                    side: entry_side.to_string(),
+                    entry_time_ms,
+                    exit_time_ms: fill.time,
+                    entry_price,
+                    exit_price,
+                    quantity,
+                    realized_pnl: trade_realized_pnl,
+                    commission: trade_commission,
+                    net_pnl,
+                });
+                next_id += 1;
+
+                // Reset tracking
+                position_cost = 0.0;
+                trade_commission = 0.0;
+                trade_realized_pnl = 0.0;
+
+                // Handle position flip (e.g., close long + open short in one fill)
+                let flip_qty = fill_qty.abs() - closed_qty;
+                if flip_qty.abs() > 1e-15 {
+                    entry_time_ms = fill.time;
+                    entry_side = if fill_qty > 0.0 { "LONG" } else { "SHORT" };
+                    position_cost = fill.price * flip_qty;
+                    // commission and realized_pnl already accumulated above for the
+                    // closing portion; the flip portion's realized_pnl starts at 0
+                    trade_realized_pnl = 0.0;
+                }
+            } else {
+                // Partially closed — adjust cost basis proportionally
+                let remaining_ratio = remaining_qty / prev_qty.abs();
+                position_cost *= remaining_ratio;
+                // position_qty already updated above
+            }
+        }
+    }
+
+    round_trips
+}
+
 /// Binance Futures Testnet HTTP client.
 #[derive(Clone)]
 pub struct BinanceTestnetClient {
