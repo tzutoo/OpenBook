@@ -1,6 +1,7 @@
 mod micro;
 mod models;
 mod signal;
+mod strategy;
 mod ui;
 mod workspace;
 

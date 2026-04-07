@@ -369,3 +369,305 @@ Run with: `cargo test --release`
 - **Trade history pruning**: `TradeHistory` prunes by `received_at_ms`, but signal computation filters by `received_at_ms` as well. There may be slight misalignment with exchange-time-based metrics.
 - **No internal timer**: The extractor does not spawn threads or timers. The caller is responsible for calling `sample()` at the desired cadence.
 - **Single symbol**: Each `SignalExtractor` instance is bound to one symbol via `SignalConfig.symbol`. For multi-symbol strategies, create multiple extractors (each with its own `SharedState`).
+
+---
+
+# Strategy Module (`strategy.rs`)
+
+## Overview
+
+The `strategy` module consumes `SignalSample`s from the signal module, aggregates them into 1-minute bars, and produces trading decisions (`GoLong`, `GoShort`, `ExitLong`, `ExitShort`, `Hold`). It includes position management, risk controls, circuit breakers, and performance reporting — all without touching existing application code.
+
+## Architecture
+
+```
+SignalExtractor.sample()  →  SignalSample (every 1s)
+         │
+         ▼
+SignalBarAggregator.push()  →  AggregatedBar (every 60s)
+         │
+         ▼
+StrategyEngine.on_bar()  →  Signal (GoLong/GoShort/Exit/Hold)
+         │
+    ┌────┼────┐
+    ▼    ▼    ▼
+Position  TradeLogger  PerformanceReport
+```
+
+## Public Types
+
+### `AggregatedBar`
+
+Rolls up per-second `SignalSample`s into a single 1-minute bar with statistics.
+
+| Field Group | Fields | Description |
+|---|---|---|
+| **Time** | `bar_start_ms`, `bar_end_ms`, `sample_count` | Bar boundaries and sample count |
+| **Price** | `open_price`, `close_price`, `high_price`, `low_price`, `avg_mid_price` | OHLCV from mid-price series |
+| **Order Book** | `ob_imbalance_mean/max/min`, `ob_imbalance_trend` | Imbalance stats + linear regression slope |
+| **Fill:Kill** | `fk_net_direction_mean/max/min/final`, `fk_buy/sell_fill/kill_total` | Direction aggregates + raw totals |
+| **Aggression** | `aggression_shift_mean/max/min/final` | Shift statistics |
+| **Absorption** | `absorption_score_max/mean/final` | Absorption statistics |
+| **Impact** | `avg_impact_buy/sell_slippage_bps` | Average slippage for standard notional |
+| **Trade Flow** | `total_trade_volume`, `avg_buy_volume_pct`, `avg_trade_count_per_sec` | Activity metrics |
+
+### `SignalBarAggregator`
+
+```rust
+let mut aggregator = SignalBarAggregator::new(60_000); // 1-minute bars
+
+// Call every second:
+if let Some(bar) = aggregator.push(sample) {
+    // A bar completed — feed it to the strategy engine
+    let signal = engine.on_bar(&bar);
+}
+```
+
+| Method | Description |
+|---|---|
+| `new(bar_duration_ms)` | Create aggregator. Bar boundaries are aligned to wall-clock multiples of `bar_duration_ms`. |
+| `push(sample)` | Add a sample. Returns `Some(AggregatedBar)` when a bar closes. |
+| `flush()` | Force-close the current partial bar (call at shutdown). |
+
+### `Signal` enum
+
+```rust
+pub enum Signal {
+    GoLong,      // Open a long position
+    GoShort,     // Open a short position
+    ExitLong,    // Close long position
+    ExitShort,   // Close short position
+    Hold,        // Do nothing
+}
+```
+
+### `StrategyConfig`
+
+All tunable parameters with sensible defaults.
+
+| Field | Default | Description |
+|---|---|---|
+| `bar_duration_ms` | `60_000` | Bar aggregation window |
+| `long_entry_threshold` | `0.5` | Minimum composite score for long entry |
+| `short_entry_threshold` | `-0.5` | Maximum composite score for short entry |
+| `min_absorption_for_reversal` | `0.7` | Absorption must exceed this for reversal entries |
+| `long_exit_threshold` | `-0.2` | Score below this exits long |
+| `short_exit_threshold` | `0.2` | Score above this exits short |
+| `weight_fk_direction` | `0.30` | Weight for fill:kill net direction |
+| `weight_aggression_shift` | `0.25` | Weight for aggression shift |
+| `weight_ob_imbalance` | `0.15` | Weight for order book imbalance |
+| `weight_absorption` | `0.15` | Weight for absorption signal |
+| `weight_buy_volume_pct` | `0.15` | Weight for buy volume deviation |
+| `risk_per_trade_pct` | `0.5` | Max equity % risked per trade |
+| `max_position_size_usd` | `10_000.0` | Maximum position notional |
+| `stop_loss_pct` | `0.15` | Stop loss as % of position value |
+| `take_profit_pct` | `0.30` | Take profit as % of position value (~2:1 R:R) |
+| `trailing_stop_activation_pct` | `0.15` | Activate trailing after this profit % |
+| `trailing_stop_distance_pct` | `0.08` | Trailing stop distance from peak |
+| `time_stop_ms` | `180_000` | Exit if no profit after 3 minutes |
+| `max_open_positions` | `1` | Max concurrent positions |
+| `daily_loss_limit_pct` | `3.0` | Halt trading if daily loss exceeds this % |
+| `max_consecutive_losses` | `5` | Halt after this many consecutive losses |
+| `cooldown_after_loss_ms` | `30_000` | Wait before re-entering after a loss |
+
+### `StrategyEngine`
+
+The core decision engine.
+
+```rust
+let mut engine = StrategyEngine::new(
+    StrategyConfig::default(),
+    10_000.0, // starting equity in USD
+);
+
+// On each completed bar:
+let signal = engine.on_bar(&bar);
+match signal {
+    Signal::GoLong  => { /* execute buy */ }
+    Signal::GoShort => { /* execute sell */ }
+    Signal::ExitLong | Signal::ExitShort => { /* close position */ }
+    Signal::Hold    => {}
+}
+```
+
+#### Composite Score Formula
+
+```
+absorption_direction =
+  if absorption_score_max > 0.7 AND fk_net_direction_mean < 0:  +absorption_score_max  (buy reversal)
+  elif absorption_score_max > 0.7 AND fk_net_direction_mean > 0: -absorption_score_max  (sell reversal)
+  else: 0.0
+
+buy_volume_normalized = (avg_buy_volume_pct - 50.0) / 50.0
+
+score = weight_fk_direction     * fk_net_direction_mean
+      + weight_aggression_shift * aggression_shift_mean
+      + weight_ob_imbalance     * ob_imbalance_mean
+      + weight_absorption       * absorption_direction
+      + weight_buy_volume_pct   * buy_volume_normalized
+```
+
+#### Entry Logic
+
+1. Session must be active (circuit breakers not triggered)
+2. Cooldown period must have elapsed since last exit
+3. Score must cross threshold (`> 0.5` for long, `< -0.5` for short)
+4. **Confirmation required**: either `absorption_score_max >= 0.7` (reversal) OR `fk_net_direction_mean > 0.2` / `< -0.2` (momentum)
+
+#### Exit Logic (priority order)
+
+1. **Stop loss**: unrealized loss >= `stop_loss_pct`
+2. **Take profit**: unrealized profit >= `take_profit_pct`
+3. **Trailing stop**: after `trailing_stop_activation_pct` profit, trail at `trailing_stop_distance_pct` from peak
+4. **Time stop**: hold duration > `time_stop_ms` with no profit
+5. **Signal reversal**: score crosses exit threshold
+
+#### Position Sizing
+
+```
+quantity_usd = equity * (risk_per_trade_pct / 100) / (stop_loss_pct / 100)
+quantity_usd = min(quantity_usd, max_position_size_usd)
+quantity = quantity_usd / entry_price
+```
+
+#### Circuit Breakers
+
+Trading halts when:
+- Daily P&L drops below `-daily_loss_limit_pct` of equity
+- Consecutive losses reach `max_consecutive_losses`
+
+Reset with `engine.reset_daily(current_equity)` at session start.
+
+#### Performance Accessors
+
+| Method | Returns |
+|---|---|
+| `position()` | Current `&Position` |
+| `trade_history()` | `&[TradeRecord]` |
+| `equity()` | Current equity |
+| `daily_pnl()` | Session P&L |
+| `is_session_active()` | Whether circuit breakers allow trading |
+| `win_rate()` | Win rate from trade history |
+| `profit_factor()` | Gross profit / gross loss |
+| `total_pnl()` | Sum of all trade P&Ls |
+| `max_drawdown_pct()` | Maximum drawdown from equity curve |
+
+### `Position`
+
+| Field | Description |
+|---|---|
+| `state` | `Flat`, `Long`, or `Short` |
+| `entry_price` | Fill price |
+| `entry_time_ms` | Entry timestamp |
+| `quantity` | Position size in base units |
+| `unrealized_pnl` | Current floating P&L |
+| `max_favorable` | Best unrealized profit since entry (for trailing stop) |
+| `max_adverse` | Worst unrealized loss since entry |
+
+### `TradeRecord`
+
+Complete record of a closed trade: `id`, `symbol`, `side`, entry/exit times and prices, `quantity`, `pnl`, `pnl_pct`, `hold_duration_ms`, `exit_reason`.
+
+### `TradeLogger`
+
+```rust
+let mut logger = TradeLogger::open("trades.csv")?;
+logger.write_trade(&trade_record)?;
+```
+
+CSV columns: `id,symbol,side,entry_time_ms,exit_time_ms,entry_price,exit_price,quantity,pnl,pnl_pct,hold_duration_ms,exit_reason`
+
+### `PerformanceReport`
+
+Comprehensive analytics generated from trade history:
+
+```rust
+let report = PerformanceReport::from_trades(&engine.trade_history(), starting_equity);
+println!("Win rate: {:.1}%", report.win_rate);
+println!("Profit factor: {:.2}", report.profit_factor);
+println!("Max drawdown: {:.2}%", report.max_drawdown_pct);
+println!("Sharpe ratio: {:.2}", report.sharpe_ratio);
+```
+
+| Field | Description |
+|---|---|
+| `total_trades` | Total closed trades |
+| `win_rate` | Winning trades / total trades |
+| `total_pnl` / `total_pnl_pct` | Absolute and percentage P&L |
+| `avg_win` / `avg_loss` | Average winning/losing trade P&L |
+| `profit_factor` | Gross profit / gross loss |
+| `max_drawdown_pct` | Maximum peak-to-trough drawdown |
+| `sharpe_ratio` | Simplified Sharpe (risk-free = 0) |
+| `avg_hold_duration_ms` | Average time in position |
+| `best_trade_pnl` / `worst_trade_pnl` | Extremes |
+| `longest_win_streak` / `longest_loss_streak` | Consecutive streaks |
+
+---
+
+## Full Pipeline Example
+
+```rust
+use crate::signal::{SignalExtractor, SignalConfig, SignalLogger};
+use crate::strategy::{
+    SignalBarAggregator, StrategyEngine, StrategyConfig, TradeLogger, PerformanceReport,
+};
+
+// Setup
+let signal_config = SignalConfig { symbol: "btcusdt".into(), ..Default::default() };
+let mut extractor = SignalExtractor::new(Arc::clone(&shared), signal_config);
+let mut aggregator = SignalBarAggregator::new(60_000);
+let mut engine = StrategyEngine::new(StrategyConfig::default(), 10_000.0);
+let mut signal_logger = SignalLogger::open("btcusdt_signals.csv")?;
+let mut trade_logger = TradeLogger::open("btcusdt_trades.csv")?;
+
+// Main loop (every second)
+loop {
+    let sample = extractor.sample();
+    signal_logger.write_sample(&sample)?;
+
+    if let Some(bar) = aggregator.push(sample) {
+        let signal = engine.on_bar(&bar);
+
+        match signal {
+            Signal::GoLong => execute_market_buy(engine.calculate_position_size(bar.close_price)),
+            Signal::GoShort => execute_market_sell(engine.calculate_position_size(bar.close_price)),
+            Signal::ExitLong | Signal::ExitShort => close_position(),
+            Signal::Hold => {}
+        }
+
+        // Log completed trades
+        for trade in &engine.trade_history()[prev_count..] {
+            trade_logger.write_trade(trade)?;
+        }
+    }
+
+    std::thread::sleep(Duration::from_secs(1));
+}
+
+// At end of session:
+if let Some(partial) = aggregator.flush() {
+    engine.on_bar(&partial);
+}
+let report = PerformanceReport::from_trades(engine.trade_history(), 10_000.0);
+println!("{:#?}", report);
+```
+
+## Strategy Module Tests
+
+11 unit tests covering:
+
+| Test | What It Validates |
+|---|---|
+| `test_bar_aggregation` | 60 samples produce correct AggregatedBar fields |
+| `test_bar_flush` | Partial bar returned on flush |
+| `test_linear_slope` | Trend calculation for constant, increasing, decreasing series |
+| `test_position_flat` | Initial position state |
+| `test_position_update_market` | Unrealized P&L for long and short positions |
+| `test_strategy_long_entry` | Bullish bar triggers GoLong |
+| `test_strategy_short_entry` | Bearish bar triggers GoShort |
+| `test_strategy_stop_loss` | Losing position triggers exit |
+| `test_strategy_take_profit` | Winning position triggers exit at target |
+| `test_strategy_circuit_breaker` | Trading halts after daily loss limit |
+| `test_performance_report` | Report metrics calculated correctly from known trades |
+
+Run with: `cargo test --release`
