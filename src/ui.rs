@@ -357,6 +357,8 @@ pub struct OrderBookApp {
     login_connecting: bool,
     binance_client: Option<Arc<crate::execution::BinanceTestnetClient>>,
     show_api_log: bool,
+    /// Real trade history fetched from Binance testnet (oldest-first).
+    binance_trades: Vec<crate::execution::UserTrade>,
 }
 
 struct AppPaneRenderer<'a> {
@@ -542,12 +544,13 @@ impl OrderBookApp {
             _signal_log_scroll: 0.0,
             _trade_log_scroll: 0.0,
             logged_in: false,
-            login_key_input: String::new(),
-            login_secret_input: String::new(),
+            login_key_input: "xeYnwRcillnZK6O0dxEqIUe7LpbwguT5qEGFW7FLWtE3sOQZax5oWjg6oFGXq3mx".to_string(),
+            login_secret_input: "tALxAShmOoULMzxz37z0QNobLbhGK56uUxn6qJqDGZs1tpFlUWHIL97suetzEGIR".to_string(),
             login_error: None,
             login_connecting: false,
             binance_client: None,
             show_api_log: false,
+            binance_trades: Vec::new(),
         }
     }
 
@@ -592,8 +595,6 @@ impl OrderBookApp {
         self.last_bar = None;
         self.last_signal = Signal::Hold;
         self.last_instant_score = 0.0;
-        self.equity_history.clear();
-        self.equity_history.push((0, self.initial_equity));
         let sig_config = SignalConfig {
             symbol: symbol.clone(),
             ..SignalConfig::default()
@@ -609,6 +610,7 @@ impl OrderBookApp {
 
         self.active_symbol = symbol.clone();
         self.active_bin_width = bin_width;
+        self.sync_binance_history();
 
         // Reset heatmap state
         self.heatmap_texture = None;
@@ -796,6 +798,65 @@ impl OrderBookApp {
         self.dock_tree = build_default_tree();
         self.pane_tile_ids = ensure_all_panes(&mut self.dock_tree);
         self.layout_dirty = true;
+    }
+
+    /// Fetch real trade history from Binance and rebuild equity curve.
+    ///
+    /// Call this after login and on symbol reconnect so the trade log
+    /// and equity curve reflect actual exchange history, not just in-memory
+    /// simulation trades.
+    fn sync_binance_history(&mut self) {
+        let client = match &self.binance_client {
+            Some(c) => c,
+            None => return,
+        };
+
+        let symbol = self.active_symbol.to_uppercase();
+
+        // Fetch all user trades for this symbol
+        match client.fetch_all_user_trades(&symbol) {
+            Ok(trades) => {
+                self.binance_trades = trades;
+            }
+            Err(_) => {
+                // Error is already logged inside fetch_all_user_trades via signed_get
+                self.binance_trades.clear();
+                return;
+            }
+        }
+
+        // Rebuild equity curve from cumulative realized PnL.
+        // current_balance was already synced via get_balance() before this call.
+        // Walk backwards: balance_before_first = current - sum(all net PnL),
+        // then walk forwards to build the curve.
+        if self.binance_trades.is_empty() {
+            self.equity_history.clear();
+            self.equity_history.push((0, self.initial_equity));
+            return;
+        }
+
+        // Binance returns commission as negative (e.g. "-0.078"), so add it to PnL
+        let total_net_pnl: f64 = self.binance_trades.iter()
+            .map(|t| t.realized_pnl + t.commission)
+            .sum();
+
+        let balance_before_first = self.initial_equity - total_net_pnl;
+        let first_trade_time = self.binance_trades.first().map(|t| t.time).unwrap_or(0);
+
+        let mut equity_history = vec![(first_trade_time.saturating_sub(1000), balance_before_first)];
+        let mut running_equity = balance_before_first;
+        for trade in &self.binance_trades {
+            running_equity += trade.realized_pnl + trade.commission;
+            equity_history.push((trade.time, running_equity));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        equity_history.push((now, self.initial_equity));
+
+        self.equity_history = equity_history;
     }
 }
 
@@ -3904,8 +3965,8 @@ impl OrderBookApp {
     }
 
     fn render_trade_log_pane(&mut self, ui: &mut egui::Ui) {
-        let trades = self.strategy_engine.trade_history();
-        
+        let trades = &self.binance_trades;
+
         egui::ScrollArea::vertical()
             .id_salt("trade_log_scroll")
             .auto_shrink([false, false])
@@ -3913,72 +3974,60 @@ impl OrderBookApp {
                 if trades.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
-                        ui.label(egui::RichText::new("No trades yet").color(egui::Color32::GRAY).size(13.0));
-                        ui.label(egui::RichText::new("Waiting for strategy signals...").color(egui::Color32::from_rgb(60, 65, 75)).small());
+                        ui.label(egui::RichText::new("No trades on exchange").color(egui::Color32::GRAY).size(13.0));
+                        ui.label(egui::RichText::new("Trade history from Binance testnet").color(egui::Color32::from_rgb(60, 65, 75)).small());
                     });
                     return;
                 }
-                
+
                 // Table header
                 ui.horizontal(|ui| {
-                    let header_color = egui::Color32::from_rgb(100, 110, 130);
-                    ui.add_sized([22.0, 16.0], egui::Label::new(
-                        egui::RichText::new("#").color(header_color).size(10.0)));
-                    ui.add_sized([72.0, 16.0], egui::Label::new(
-                        egui::RichText::new("TIME").color(header_color).size(10.0)));
-                    ui.add_sized([34.0, 16.0], egui::Label::new(
-                        egui::RichText::new("SIDE").color(header_color).size(10.0)));
-                    ui.add_sized([62.0, 16.0], egui::Label::new(
-                        egui::RichText::new("ENTRY").color(header_color).size(10.0)));
-                    ui.add_sized([62.0, 16.0], egui::Label::new(
-                        egui::RichText::new("EXIT").color(header_color).size(10.0)));
-                    ui.add_sized([52.0, 16.0], egui::Label::new(
-                        egui::RichText::new("PnL").color(header_color).size(10.0)));
-                    ui.add_sized([40.0, 16.0], egui::Label::new(
-                        egui::RichText::new("PnL%").color(header_color).size(10.0)));
-                    ui.add_sized([60.0, 16.0], egui::Label::new(
-                        egui::RichText::new("REASON").color(header_color).size(10.0)));
+                    let hc = egui::Color32::from_rgb(100, 110, 130);
+                    ui.add_sized([30.0, 16.0], egui::Label::new(egui::RichText::new("ID").color(hc).size(10.0)));
+                    ui.add_sized([72.0, 16.0], egui::Label::new(egui::RichText::new("TIME").color(hc).size(10.0)));
+                    ui.add_sized([36.0, 16.0], egui::Label::new(egui::RichText::new("SIDE").color(hc).size(10.0)));
+                    ui.add_sized([68.0, 16.0], egui::Label::new(egui::RichText::new("PRICE").color(hc).size(10.0)));
+                    ui.add_sized([52.0, 16.0], egui::Label::new(egui::RichText::new("QTY").color(hc).size(10.0)));
+                    ui.add_sized([58.0, 16.0], egui::Label::new(egui::RichText::new("REAL PnL").color(hc).size(10.0)));
+                    ui.add_sized([50.0, 16.0], egui::Label::new(egui::RichText::new("COMM").color(hc).size(10.0)));
+                    ui.add_sized([36.0, 16.0], egui::Label::new(egui::RichText::new("MAKER").color(hc).size(10.0)));
                 });
                 ui.separator();
-                
+
                 // Show trades newest first
                 for trade in trades.iter().rev() {
                     ui.horizontal(|ui| {
-                        ui.add_sized([22.0, 16.0], egui::Label::new(
+                        let row_color = egui::Color32::from_rgb(140, 150, 170);
+
+                        ui.add_sized([30.0, 16.0], egui::Label::new(
                             egui::RichText::new(format!("{}", trade.id)).color(egui::Color32::GRAY).size(10.0)));
 
-                        let time_str = format_hms_millis(trade.entry_time_ms);
+                        let time_str = format_hms_millis(trade.time);
                         ui.add_sized([72.0, 16.0], egui::Label::new(
-                            egui::RichText::new(time_str).color(egui::Color32::from_rgb(140, 150, 170)).size(10.0)));
-                        
-                        let side_text = match trade.side {
-                            crate::strategy::Side::Buy => "BUY",
-                            crate::strategy::Side::Sell => "SELL",
-                        };
-                        let side_color = match trade.side {
-                            crate::strategy::Side::Buy => BID_COLOR,
-                            crate::strategy::Side::Sell => ASK_COLOR,
-                        };
-                        ui.add_sized([34.0, 16.0], egui::Label::new(
-                            egui::RichText::new(side_text).color(side_color).size(10.0)));
-                        
-                        ui.add_sized([62.0, 16.0], egui::Label::new(
-                            egui::RichText::new(format!("{:.2}", trade.entry_price)).color(egui::Color32::WHITE).size(10.0)));
-                        
-                        ui.add_sized([62.0, 16.0], egui::Label::new(
-                            egui::RichText::new(format!("{:.2}", trade.exit_price)).color(egui::Color32::WHITE).size(10.0)));
-                        
-                        let pnl_color = if trade.pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
-                        let pnl_str = format!("{:+.2}", trade.pnl);
+                            egui::RichText::new(time_str).color(row_color).size(10.0)));
+
+                        let side_color = if trade.side == "BUY" { BID_COLOR } else { ASK_COLOR };
+                        ui.add_sized([36.0, 16.0], egui::Label::new(
+                            egui::RichText::new(&trade.side).color(side_color).size(10.0)));
+
+                        ui.add_sized([68.0, 16.0], egui::Label::new(
+                            egui::RichText::new(format!("{:.2}", trade.price)).color(egui::Color32::WHITE).size(10.0)));
+
                         ui.add_sized([52.0, 16.0], egui::Label::new(
-                            egui::RichText::new(pnl_str).color(pnl_color).strong().size(10.0)));
-                        
-                        let pnl_pct_str = format!("{:+.2}%", trade.pnl_pct);
-                        ui.add_sized([40.0, 16.0], egui::Label::new(
-                            egui::RichText::new(pnl_pct_str).color(pnl_color).size(10.0)));
-                        
-                        ui.add_sized([60.0, 16.0], egui::Label::new(
-                            egui::RichText::new(&trade.exit_reason).color(egui::Color32::from_rgb(130, 140, 160)).size(9.0)));
+                            egui::RichText::new(format!("{:.4}", trade.qty)).color(egui::Color32::WHITE).size(10.0)));
+
+                        let pnl_color = if trade.realized_pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
+                        ui.add_sized([58.0, 16.0], egui::Label::new(
+                            egui::RichText::new(format!("{:+.4}", trade.realized_pnl)).color(pnl_color).strong().size(10.0)));
+
+                        let comm_color = if trade.commission > 0.0 { ASK_COLOR } else { egui::Color32::GRAY };
+                        ui.add_sized([50.0, 16.0], egui::Label::new(
+                            egui::RichText::new(format!("-{:.4}", trade.commission)).color(comm_color).size(10.0)));
+
+                        let maker_text = if trade.maker { "Y" } else { "N" };
+                        let maker_color = if trade.maker { BID_COLOR } else { egui::Color32::from_rgb(80, 85, 95) };
+                        ui.add_sized([36.0, 16.0], egui::Label::new(
+                            egui::RichText::new(maker_text).color(maker_color).size(10.0)));
                     });
                 }
             });
@@ -4303,9 +4352,8 @@ impl OrderBookApp {
                                             .map(|d| d.as_millis() as u64)
                                             .unwrap_or(0),
                                     );
-                                    self.equity_history.clear();
-                                    self.equity_history.push((0, balance));
                                     self.binance_client = Some(client);
+                                    self.sync_binance_history();
                                     self.logged_in = true;
                                 }
                                 Err(e) => {

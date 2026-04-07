@@ -851,6 +851,38 @@ impl BinanceTestnetClient {
         Ok(result)
     }
 
+    /// Fetch all user trades for a symbol, paginating through the full history.
+    ///
+    /// Returns trades oldest-first. The Binance API returns max 1000 per request,
+    /// so this method pages through using `fromId` until fewer than 1000 are returned.
+    pub fn fetch_all_user_trades(
+        &self,
+        symbol: &str,
+    ) -> Result<Vec<UserTrade>, String> {
+        let mut all_trades = Vec::new();
+        // Start from the oldest available trades (id=1) and page forward.
+        // Without fromId the API returns the most recent 7 days only.
+        let mut from_id: Option<u64> = Some(1);
+        let page_limit = 1000u32;
+
+        loop {
+            let mut trades = self.get_user_trades(symbol, from_id, page_limit)?;
+            let count = trades.len();
+
+            if let Some(last) = trades.last() {
+                from_id = Some(last.id + 1);
+            }
+
+            all_trades.append(&mut trades);
+
+            if count < page_limit as usize {
+                break;
+            }
+        }
+
+        Ok(all_trades)
+    }
+
     /// Get available USDT balance.
     ///
     /// Convenience method that calls get_account and returns the USDT available balance.
