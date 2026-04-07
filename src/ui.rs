@@ -12,6 +12,11 @@ use crate::workspace::{
     LAYOUT_STORE_V1_KEY, LAYOUT_STORE_V2_KEY,
 };
 use crate::{spawn_ticker_task, spawn_ws_task};
+use crate::signal::{SignalExtractor, SignalConfig};
+use crate::strategy::{
+    AggregatedBar, PerformanceReport, PositionState, Signal, SignalBarAggregator,
+    StrategyConfig as StratConfig, StrategyEngine,
+};
 use eframe::egui;
 use ordered_float::OrderedFloat;
 use std::collections::{BTreeMap, HashMap};
@@ -330,6 +335,18 @@ pub struct OrderBookApp {
     last_interaction_time: Instant,
     show_perf_overlay: bool,
     perf_stats: PerfStats,
+    // -- Strategy pipeline --
+    strategy_enabled: bool,
+    signal_extractor: Option<SignalExtractor>,
+    signal_aggregator: SignalBarAggregator,
+    strategy_engine: StrategyEngine,
+    initial_equity: f64,
+    last_sample_time: std::time::Instant,
+    equity_history: Vec<(u64, f64)>,  // (timestamp_ms, equity)
+    last_bar: Option<AggregatedBar>,
+    last_signal: Signal,
+    _signal_log_scroll: f32,
+    _trade_log_scroll: f32,
 }
 
 struct AppPaneRenderer<'a> {
@@ -346,6 +363,9 @@ impl PaneRenderer for AppPaneRenderer<'_> {
             PaneKind::MarketImpact => self.app.render_market_impact_pane_body(ui, self.state),
             PaneKind::FillKill => self.app.render_fill_kill_pane_body(ui, self.state),
             PaneKind::TradesTape => self.app.render_trades_tape_pane_body(ui, self.state),
+            PaneKind::Strategy => self.app.render_strategy_pane(ui, self.state),
+            PaneKind::TradeLog => self.app.render_trade_log_pane(ui),
+            PaneKind::EquityCurve => self.app.render_equity_curve_pane(ui),
         }
     }
 }
@@ -417,6 +437,14 @@ impl OrderBookApp {
         }
 
         // Start WS immediately
+        // Strategy pipeline initialization
+        let strat_config = StratConfig {
+            symbol: default_symbol.clone(),
+            ..StratConfig::default()
+        };
+        let initial_equity = 10_000.0;
+        let strategy_engine = StrategyEngine::new(strat_config.clone(), initial_equity);
+
         spawn_ws_task(
             default_symbol.clone(),
             default_bin,
@@ -424,6 +452,13 @@ impl OrderBookApp {
             Arc::clone(&shutdown_flag),
         );
         spawn_ticker_task(Arc::clone(&picker_state), Arc::clone(&ticker_shutdown));
+
+        // Create signal extractor (needs shared state)
+        let sig_config = SignalConfig {
+            symbol: default_symbol.clone(),
+            ..SignalConfig::default()
+        };
+        let signal_extractor = SignalExtractor::new(Arc::clone(&shared), sig_config);
 
         Self {
             shared,
@@ -484,6 +519,17 @@ impl OrderBookApp {
             last_interaction_time: Instant::now(),
             show_perf_overlay: true,
             perf_stats: PerfStats::new(),
+            strategy_enabled: true,
+            signal_extractor: Some(signal_extractor),
+            signal_aggregator: SignalBarAggregator::new(60_000),
+            strategy_engine,
+            initial_equity,
+            last_sample_time: std::time::Instant::now(),
+            equity_history: vec![(0, initial_equity)],
+            last_bar: None,
+            last_signal: Signal::Hold,
+            _signal_log_scroll: 0.0,
+            _trade_log_scroll: 0.0,
         }
     }
 
@@ -501,6 +547,23 @@ impl OrderBookApp {
         self.shared = Arc::new(Mutex::new(SharedState::new()));
 
         let symbol = self.symbol_input.trim().to_lowercase();
+
+        // Reset strategy pipeline on reconnect
+        let strat_config = StratConfig {
+            symbol: symbol.clone(),
+            ..StratConfig::default()
+        };
+        self.strategy_engine = StrategyEngine::new(strat_config, self.initial_equity);
+        self.signal_aggregator = SignalBarAggregator::new(60_000);
+        self.last_bar = None;
+        self.last_signal = Signal::Hold;
+        self.equity_history.clear();
+        self.equity_history.push((0, self.initial_equity));
+        let sig_config = SignalConfig {
+            symbol: symbol.clone(),
+            ..SignalConfig::default()
+        };
+        self.signal_extractor = Some(SignalExtractor::new(Arc::clone(&self.shared), sig_config));
         let symbol = if symbol.is_empty() {
             "btcusdt".to_string()
         } else {
@@ -734,6 +797,37 @@ impl eframe::App for OrderBookApp {
             let mut shared = self.shared.lock().unwrap();
             shared.clone_snapshot(self.impact_notional_usd)
         };
+
+        // Strategy pipeline: sample signals every ~1 second
+        if self.strategy_enabled {
+            if let Some(ref mut extractor) = self.signal_extractor {
+                if self.last_sample_time.elapsed() >= Duration::from_millis(1000) {
+                    self.last_sample_time = std::time::Instant::now();
+                    
+                    let sample = extractor.sample();
+                    
+                    if let Some(bar) = self.signal_aggregator.push(sample.clone()) {
+                        self.last_bar = Some(bar.clone());
+                        let prev_trade_count = self.strategy_engine.trade_history().len();
+                        self.last_signal = self.strategy_engine.on_bar(&bar);
+                        
+                        // Record new trades
+                        let trades = self.strategy_engine.trade_history();
+                        for _trade in &trades[prev_trade_count..] {
+                            // trades are logged internally by the engine
+                        }
+                        
+                        // Update equity history
+                        let equity = self.strategy_engine.equity();
+                        self.equity_history.push((bar.bar_end_ms, equity));
+                        // Keep last 1440 points (24h at 1-min bars)
+                        if self.equity_history.len() > 1440 {
+                            self.equity_history.drain(..self.equity_history.len() - 1440);
+                        }
+                    }
+                }
+            }
+        }
 
         if !state.connected && state.status_msg.contains("Desynced") {
             if let Some(deadline) = self.desync_reconnect_deadline {
@@ -3390,6 +3484,452 @@ impl OrderBookApp {
 
             ui.allocate_space(egui::vec2(y_axis_w, x_axis_h));
         });
+    }
+
+    fn render_strategy_pane(&mut self, ui: &mut egui::Ui, state: &StateSnapshot) {
+        ui.vertical(|ui| {
+            // Header with toggle
+            ui.horizontal(|ui| {
+                let enabled = &mut self.strategy_enabled;
+                if ui.selectable_label(*enabled, "⏻ LIVE").clicked() {
+                    *enabled = !*enabled;
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(if self.strategy_enabled { "RUNNING" } else { "PAUSED" })
+                        .color(if self.strategy_enabled { egui::Color32::GREEN } else { egui::Color32::YELLOW })
+                        .strong()
+                        .size(13.0),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(self.active_symbol.to_uppercase())
+                        .color(egui::Color32::from_rgb(150, 160, 180))
+                        .size(12.0),
+                );
+            });
+            
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+            
+            // Composite score
+            let score = self.last_bar.as_ref()
+                .map(|b| StrategyEngine::compute_score(b))
+                .unwrap_or(0.0);
+            let score_color = if score > 0.1 {
+                BID_COLOR
+            } else if score < -0.1 {
+                ASK_COLOR
+            } else {
+                egui::Color32::GRAY
+            };
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("SCORE").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{score:+.3}")).color(score_color).strong().size(16.0));
+                });
+            });
+            
+            ui.add_space(2.0);
+            
+            // Signal indicator
+            let signal_text = match self.last_signal {
+                Signal::GoLong => "▲ GO LONG",
+                Signal::GoShort => "▼ GO SHORT",
+                Signal::ExitLong => "✕ EXIT LONG",
+                Signal::ExitShort => "✕ EXIT SHORT",
+                Signal::Hold => "— HOLD",
+            };
+            let signal_color = match self.last_signal {
+                Signal::GoLong => egui::Color32::from_rgb(0, 220, 100),
+                Signal::GoShort => egui::Color32::from_rgb(255, 80, 80),
+                Signal::ExitLong | Signal::ExitShort => egui::Color32::from_rgb(255, 180, 50),
+                Signal::Hold => egui::Color32::GRAY,
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("SIGNAL").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(signal_text).color(signal_color).strong().size(13.0));
+                });
+            });
+            
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            
+            // Position
+            let pos = self.strategy_engine.position();
+            let pos_state_text = match pos.state {
+                PositionState::Flat => "FLAT",
+                PositionState::Long => "LONG",
+                PositionState::Short => "SHORT",
+            };
+            let pos_color = match pos.state {
+                PositionState::Flat => egui::Color32::GRAY,
+                PositionState::Long => BID_COLOR,
+                PositionState::Short => ASK_COLOR,
+            };
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("POSITION").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(pos_state_text).color(pos_color).strong().size(14.0));
+                });
+            });
+            
+            if !pos.is_flat() {
+                ui.add_space(2.0);
+                
+                // Entry price
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("ENTRY").color(egui::Color32::GRAY).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("{:.2}", pos.entry_price))
+                            .color(egui::Color32::WHITE).size(12.0));
+                    });
+                });
+                
+                // Current price
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CURRENT").color(egui::Color32::GRAY).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("{:.2}", state.mid_price))
+                            .color(egui::Color32::WHITE).size(12.0));
+                    });
+                });
+                
+                // Unrealized PnL
+                let pnl_color = if pos.unrealized_pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("PnL").color(egui::Color32::GRAY).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("{:+.2}", pos.unrealized_pnl))
+                            .color(pnl_color).strong().size(13.0));
+                    });
+                });
+            }
+            
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            
+            // Account summary
+            let equity = self.strategy_engine.equity();
+            let daily_pnl = self.strategy_engine.daily_pnl();
+            let equity_color = if equity >= self.initial_equity { BID_COLOR } else { ASK_COLOR };
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("EQUITY").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{:.2}", equity))
+                        .color(equity_color).strong().size(13.0));
+                });
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("INITIAL").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{:.2}", self.initial_equity))
+                        .color(egui::Color32::GRAY).size(12.0));
+                });
+            });
+            
+            let daily_color = if daily_pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("DAILY PnL").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{daily_pnl:+.2}"))
+                        .color(daily_color).strong().size(13.0));
+                });
+            });
+            
+            let daily_pct = if self.initial_equity > 0.0 {
+                (daily_pnl / self.initial_equity) * 100.0
+            } else {
+                0.0
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("DAILY %").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{daily_pct:+.2}%"))
+                        .color(daily_color).size(12.0));
+                });
+            });
+            
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            
+            // Performance stats
+            let trades = self.strategy_engine.trade_history();
+            let report = PerformanceReport::from_trades(trades, self.initial_equity);
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("TRADES").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{}", report.total_trades))
+                        .color(egui::Color32::WHITE).size(12.0));
+                });
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("WIN RATE").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{:.1}%", report.win_rate))
+                        .color(if report.win_rate >= 50.0 { BID_COLOR } else { ASK_COLOR }).size(12.0));
+                });
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("PROFIT FACTOR").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{:.2}", report.profit_factor))
+                        .color(egui::Color32::WHITE).size(12.0));
+                });
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("MAX DD").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{:.2}%", report.max_drawdown_pct))
+                        .color(ASK_COLOR).size(12.0));
+                });
+            });
+            
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            
+            // Circuit breaker status
+            let session_active = self.strategy_engine.is_session_active();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("CIRCUIT").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (text, color) = if session_active {
+                        ("ACTIVE", egui::Color32::GREEN)
+                    } else {
+                        ("TRIPPED", egui::Color32::RED)
+                    };
+                    ui.label(egui::RichText::new(text).color(color).strong().size(12.0));
+                });
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("CONSEC LOSS").color(egui::Color32::GRAY).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{}", self.strategy_engine.consecutive_losses()))
+                        .color(if self.strategy_engine.consecutive_losses() > 2 { AMBER_COLOR } else { egui::Color32::WHITE })
+                        .size(12.0));
+                });
+            });
+            
+            // Signal breakdown (last bar details)
+            if let Some(ref bar) = self.last_bar {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("SIGNAL BREAKDOWN").color(egui::Color32::GRAY).small());
+                
+                fn label_row(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(label).color(egui::Color32::from_rgb(90, 95, 105)).size(10.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(value).color(color).size(10.0));
+                        });
+                    });
+                }
+                
+                label_row(ui, "FK Direction", &format!("{:.3}", bar.fk_net_direction_mean),
+                    if bar.fk_net_direction_mean > 0.0 { BID_COLOR } else { ASK_COLOR });
+                label_row(ui, "Aggr Shift", &format!("{:.3}", bar.aggression_shift_mean),
+                    if bar.aggression_shift_mean > 0.0 { BID_COLOR } else { ASK_COLOR });
+                label_row(ui, "OB Imbalance", &format!("{:.3}", bar.ob_imbalance_mean),
+                    if bar.ob_imbalance_mean > 0.0 { BID_COLOR } else { ASK_COLOR });
+                label_row(ui, "Absorption", &format!("{:.3}", bar.absorption_score_max),
+                    CYAN_COLOR);
+                label_row(ui, "Buy Vol %", &format!("{:.1}%", bar.avg_buy_volume_pct),
+                    if bar.avg_buy_volume_pct > 50.0 { BID_COLOR } else { ASK_COLOR });
+            }
+        });
+    }
+
+    fn render_trade_log_pane(&mut self, ui: &mut egui::Ui) {
+        let trades = self.strategy_engine.trade_history();
+        
+        egui::ScrollArea::vertical()
+            .id_salt("trade_log_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if trades.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(egui::RichText::new("No trades yet").color(egui::Color32::GRAY).size(13.0));
+                        ui.label(egui::RichText::new("Waiting for strategy signals...").color(egui::Color32::from_rgb(60, 65, 75)).small());
+                    });
+                    return;
+                }
+                
+                // Table header
+                ui.horizontal(|ui| {
+                    let header_color = egui::Color32::from_rgb(100, 110, 130);
+                    ui.add_sized([28.0, 16.0], egui::Label::new(
+                        egui::RichText::new("#").color(header_color).size(10.0)));
+                    ui.add_sized([36.0, 16.0], egui::Label::new(
+                        egui::RichText::new("SIDE").color(header_color).size(10.0)));
+                    ui.add_sized([65.0, 16.0], egui::Label::new(
+                        egui::RichText::new("ENTRY").color(header_color).size(10.0)));
+                    ui.add_sized([65.0, 16.0], egui::Label::new(
+                        egui::RichText::new("EXIT").color(header_color).size(10.0)));
+                    ui.add_sized([55.0, 16.0], egui::Label::new(
+                        egui::RichText::new("PnL").color(header_color).size(10.0)));
+                    ui.add_sized([42.0, 16.0], egui::Label::new(
+                        egui::RichText::new("PnL%").color(header_color).size(10.0)));
+                    ui.add_sized([55.0, 16.0], egui::Label::new(
+                        egui::RichText::new("REASON").color(header_color).size(10.0)));
+                });
+                ui.separator();
+                
+                // Show trades newest first
+                for trade in trades.iter().rev() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([28.0, 16.0], egui::Label::new(
+                            egui::RichText::new(format!("{}", trade.id)).color(egui::Color32::GRAY).size(10.0)));
+                        
+                        let side_text = match trade.side {
+                            crate::strategy::Side::Buy => "BUY",
+                            crate::strategy::Side::Sell => "SELL",
+                        };
+                        let side_color = match trade.side {
+                            crate::strategy::Side::Buy => BID_COLOR,
+                            crate::strategy::Side::Sell => ASK_COLOR,
+                        };
+                        ui.add_sized([36.0, 16.0], egui::Label::new(
+                            egui::RichText::new(side_text).color(side_color).size(10.0)));
+                        
+                        ui.add_sized([65.0, 16.0], egui::Label::new(
+                            egui::RichText::new(format!("{:.2}", trade.entry_price)).color(egui::Color32::WHITE).size(10.0)));
+                        
+                        ui.add_sized([65.0, 16.0], egui::Label::new(
+                            egui::RichText::new(format!("{:.2}", trade.exit_price)).color(egui::Color32::WHITE).size(10.0)));
+                        
+                        let pnl_color = if trade.pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
+                        let pnl_str = format!("{:+.2}", trade.pnl);
+                        ui.add_sized([55.0, 16.0], egui::Label::new(
+                            egui::RichText::new(pnl_str).color(pnl_color).strong().size(10.0)));
+                        
+                        let pnl_pct_str = format!("{:+.2}%", trade.pnl_pct);
+                        ui.add_sized([42.0, 16.0], egui::Label::new(
+                            egui::RichText::new(pnl_pct_str).color(pnl_color).size(10.0)));
+                        
+                        ui.add_sized([55.0, 16.0], egui::Label::new(
+                            egui::RichText::new(&trade.exit_reason).color(egui::Color32::from_rgb(130, 140, 160)).size(9.0)));
+                    });
+                }
+            });
+    }
+
+    fn render_equity_curve_pane(&self, ui: &mut egui::Ui) {
+        let available_rect = ui.available_rect_before_wrap();
+        let _available_width = available_rect.width();
+        let _available_height = available_rect.height().max(60.0);
+        
+        ui.allocate_rect(available_rect, egui::Sense::hover());
+        
+        let painter = ui.painter();
+        
+        if self.equity_history.len() < 2 {
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Waiting for data...").color(egui::Color32::GRAY).small());
+            });
+            return;
+        }
+        
+        let padding = 8.0;
+        let plot_left = available_rect.left() + padding;
+        let plot_right = available_rect.right() - padding;
+        let plot_top = available_rect.top() + padding;
+        let plot_bottom = available_rect.bottom() - padding;
+        let plot_width = plot_right - plot_left;
+        let plot_height = plot_bottom - plot_top;
+        
+        if plot_width < 10.0 || plot_height < 10.0 {
+            return;
+        }
+        
+        // Background
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(plot_left, plot_top),
+                egui::pos2(plot_right, plot_bottom),
+            ),
+            0.0,
+            egui::Color32::from_rgb(18, 22, 28),
+        );
+        
+        // Find min/max equity
+        let equities: Vec<f64> = self.equity_history.iter().map(|(_, e)| *e).collect();
+        let min_eq = equities.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_eq = equities.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let eq_range = (max_eq - min_eq).max(0.01);
+        
+        // Draw initial equity line
+        if min_eq <= self.initial_equity && self.initial_equity <= max_eq {
+            let initial_y = plot_bottom - ((self.initial_equity - min_eq) / eq_range) as f32 * plot_height;
+            painter.line_segment(
+                [egui::pos2(plot_left, initial_y), egui::pos2(plot_right, initial_y)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 30)),
+            );
+        }
+        
+        // Build point list
+        let n = self.equity_history.len();
+        let points: Vec<egui::Pos2> = self.equity_history.iter().enumerate().map(|(i, (_, eq))| {
+            let x = if n > 1 {
+                plot_left + (i as f64 / (n - 1) as f64) as f32 * plot_width
+            } else {
+                plot_left + plot_width / 2.0
+            };
+            let y = plot_bottom - ((eq - min_eq) / eq_range) as f32 * plot_height;
+            egui::pos2(x, y)
+        }).collect();
+        
+        // Determine line color based on trend
+        let first_eq = equities.first().copied().unwrap_or(0.0);
+        let last_eq = equities.last().copied().unwrap_or(0.0);
+        let line_color = if last_eq >= first_eq { BID_COLOR } else { ASK_COLOR };
+        
+        // Draw the equity line
+        if points.len() >= 2 {
+            painter.line(
+                points,
+                egui::Stroke::new(2.0, line_color),
+            );
+        }
+        
+        // Labels
+        painter.text(
+            egui::pos2(plot_left, plot_top - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{:.0}", max_eq),
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(120, 130, 145),
+        );
+        painter.text(
+            egui::pos2(plot_left, plot_bottom + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.0}", min_eq),
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(120, 130, 145),
+        );
+        painter.text(
+            egui::pos2(plot_right, plot_top - 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("{:.0}", last_eq),
+            egui::FontId::proportional(10.0),
+            line_color,
+        );
     }
 
     fn render_color_legend(&self, ui: &mut egui::Ui, width: f32, height: f32) {

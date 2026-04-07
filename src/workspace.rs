@@ -17,15 +17,21 @@ pub enum PaneKind {
     MarketImpact,
     FillKill,
     TradesTape,
+    Strategy,
+    TradeLog,
+    EquityCurve,
 }
 
 impl PaneKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Heatmap,
         Self::OrderBook,
         Self::MarketImpact,
         Self::FillKill,
         Self::TradesTape,
+        Self::Strategy,
+        Self::TradeLog,
+        Self::EquityCurve,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -35,6 +41,9 @@ impl PaneKind {
             Self::MarketImpact => "Market Impact",
             Self::FillKill => "Fill:Kill",
             Self::TradesTape => "Trades Tape",
+            Self::Strategy => "Strategy",
+            Self::TradeLog => "Trade Log",
+            Self::EquityCurve => "Equity",
         }
     }
 
@@ -45,6 +54,9 @@ impl PaneKind {
             Self::MarketImpact => "market_impact",
             Self::FillKill => "fill_kill",
             Self::TradesTape => "trades_tape",
+            Self::Strategy => "strategy",
+            Self::TradeLog => "trade_log",
+            Self::EquityCurve => "equity_curve",
         }
     }
 }
@@ -105,6 +117,9 @@ pub fn build_default_tree() -> Tree<PaneKind> {
     let market_impact = tiles.insert_pane(PaneKind::MarketImpact);
     let fill_kill = tiles.insert_pane(PaneKind::FillKill);
     let trades_tape = tiles.insert_pane(PaneKind::TradesTape);
+    let strategy = tiles.insert_pane(PaneKind::Strategy);
+    let trade_log = tiles.insert_pane(PaneKind::TradeLog);
+    let equity_curve = tiles.insert_pane(PaneKind::EquityCurve);
 
     let bottom = tiles.insert_horizontal_tile(vec![trades_tape, fill_kill]);
     set_linear_shares(
@@ -116,15 +131,29 @@ pub fn build_default_tree() -> Tree<PaneKind> {
     let left = tiles.insert_vertical_tile(vec![heatmap, bottom]);
     set_linear_shares(&mut tiles, left, &[(heatmap, 0.72), (bottom, 0.28)]);
 
-    let right = tiles.insert_vertical_tile(vec![order_book, market_impact]);
+    let middle = tiles.insert_vertical_tile(vec![order_book, market_impact]);
     set_linear_shares(
         &mut tiles,
-        right,
+        middle,
         &[(order_book, 0.65), (market_impact, 0.35)],
     );
 
-    let root = tiles.insert_horizontal_tile(vec![left, right]);
-    set_linear_shares(&mut tiles, root, &[(left, 0.74), (right, 0.26)]);
+    let right_strategy = tiles.insert_vertical_tile(vec![strategy, trade_log]);
+    set_linear_shares(
+        &mut tiles,
+        right_strategy,
+        &[(strategy, 0.55), (trade_log, 0.45)],
+    );
+
+    let right = tiles.insert_vertical_tile(vec![right_strategy, equity_curve]);
+    set_linear_shares(
+        &mut tiles,
+        right,
+        &[(right_strategy, 0.75), (equity_curve, 0.25)],
+    );
+
+    let root = tiles.insert_horizontal_tile(vec![left, middle, right]);
+    set_linear_shares(&mut tiles, root, &[(left, 0.55), (middle, 0.25), (right, 0.20)]);
 
     Tree::new("workspace", root, tiles)
 }
