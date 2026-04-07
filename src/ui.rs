@@ -573,14 +573,20 @@ impl OrderBookApp {
         };
         self.strategy_engine = StrategyEngine::new(strat_config, self.initial_equity);
         // Re-attach Binance client and sync position for new symbol
-        if let Some(ref client) = self.binance_client {
-            self.strategy_engine.set_binance_client(Arc::clone(client));
+        if let Some(client) = self.binance_client.take() {
+            let symbol_upper = symbol.trim().to_uppercase();
+            // Clone the client to mutate step_size, then re-wrap
+            let mut new_client = (*client).clone();
+            new_client.fetch_symbol_info(&symbol_upper);
+            let new_client = Arc::new(new_client);
+            self.strategy_engine.set_binance_client(Arc::clone(&new_client));
             self.strategy_engine.sync_from_exchange(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
             );
+            self.binance_client = Some(new_client);
         }
         self.signal_aggregator = SignalBarAggregator::new(30_000);
         self.last_bar = None;
@@ -4273,9 +4279,12 @@ impl OrderBookApp {
                             self.login_error = Some("API Key and Secret Key are required".to_string());
                         } else {
                             self.login_error = None;
-                            let client = crate::execution::BinanceTestnetClient::new(key, secret);
+                            let mut client = crate::execution::BinanceTestnetClient::new(key, secret);
                             match client.test_connection() {
                                 Ok(_) => {
+                                    // Fetch quantity step_size for current symbol
+                                    let symbol = self.active_symbol.to_uppercase();
+                                    client.fetch_symbol_info(&symbol);
                                     let client = Arc::new(client);
                                     // Sync account info after login
                                     let balance = client.get_balance().unwrap_or(10_000.0);
@@ -4336,7 +4345,7 @@ impl OrderBookApp {
             .collapsible(false)
             .open(&mut self.show_api_log)
             .show(ctx, |ui| {
-                // Header with clear button
+                // Header with copy all and clear buttons
                 ui.horizontal(|ui| {
                     let entry_count = self.binance_client
                         .as_ref()
@@ -4351,6 +4360,25 @@ impl OrderBookApp {
                         if ui.button("Clear").clicked() {
                             if let Some(ref client) = self.binance_client {
                                 client.clear_error_log();
+                            }
+                        }
+                        if ui.button("Copy All").clicked() {
+                            if let Some(ref client) = self.binance_client {
+                                let entries = client.error_log();
+                                let text: String = entries.iter().rev().map(|e| {
+                                    let code = e.status_code
+                                        .map(|c| c.to_string())
+                                        .unwrap_or_else(|| "-".to_string());
+                                    format!(
+                                        "{} {} {} {} {}",
+                                        format_hms_millis(e.timestamp_ms),
+                                        e.method,
+                                        e.endpoint,
+                                        code,
+                                        e.error_body
+                                    )
+                                }).collect::<Vec<_>>().join("\n");
+                                ctx.copy_text(text);
                             }
                         }
                     });
@@ -4418,14 +4446,25 @@ impl OrderBookApp {
                                 ui.add_sized([35.0, 14.0], egui::Label::new(
                                     egui::RichText::new(code_str).color(row_color).size(9.0)));
 
-                                // Truncate long error messages
-                                let detail = if entry.error_body.len() > 60 {
-                                    format!("{}...", &entry.error_body[..57])
+                                // Truncate long error messages with copy button
+                                let is_long = entry.error_body.len() > 55;
+                                let detail = if is_long {
+                                    format!("{}...", &entry.error_body[..52])
                                 } else {
                                     entry.error_body.clone()
                                 };
-                                ui.add_sized([280.0, 14.0], egui::Label::new(
+                                ui.add_sized([260.0, 14.0], egui::Label::new(
                                     egui::RichText::new(detail).color(row_color).size(9.0)));
+                                if is_long {
+                                    let copy_text = entry.error_body.clone();
+                                    if ui.add_sized([20.0, 14.0], egui::Button::new(
+                                        egui::RichText::new("⧉").color(row_color).size(9.0)
+                                    )).clicked() {
+                                        ctx.copy_text(copy_text);
+                                    }
+                                } else {
+                                    ui.add_sized([20.0, 14.0], egui::Label::new(""));
+                                }
                             });
                         }
                     });

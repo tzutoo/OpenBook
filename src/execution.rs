@@ -129,6 +129,7 @@ pub struct UserTrade {
 }
 
 /// Binance Futures Testnet HTTP client.
+#[derive(Clone)]
 pub struct BinanceTestnetClient {
     api_key: String,
     secret_key: String,
@@ -136,6 +137,11 @@ pub struct BinanceTestnetClient {
     http: Client,
     recv_window: u64,
     error_log: Arc<Mutex<Vec<ApiLogEntry>>>,
+    step_size: f64,
+    /// Step size for market orders (from MARKET_LOT_SIZE filter). Falls back to LOT_SIZE.
+    market_step_size: f64,
+    /// Minimum quantity for orders (from MARKET_LOT_SIZE or LOT_SIZE filter).
+    min_qty: f64,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -263,6 +269,9 @@ impl BinanceTestnetClient {
             http,
             recv_window: 5000,
             error_log: Arc::new(Mutex::new(Vec::new())),
+            step_size: 0.001,
+            market_step_size: 0.001,
+            min_qty: 0.001,
         }
     }
 
@@ -596,11 +605,19 @@ impl BinanceTestnetClient {
         side: &str,
         quantity: f64,
     ) -> Result<OrderResult, String> {
+        // Enforce minimum quantity from MARKET_LOT_SIZE / LOT_SIZE filter
+        if quantity < self.min_qty {
+            return Err(format!(
+                "Quantity {} is below minimum {} for {}",
+                quantity, self.min_qty, symbol
+            ));
+        }
+
         let params = vec![
             ("symbol".to_string(), symbol.to_string()),
             ("side".to_string(), side.to_uppercase()),
             ("type".to_string(), "MARKET".to_string()),
-            ("quantity".to_string(), quantity.to_string()),
+            ("quantity".to_string(), self.format_quantity(quantity)),
         ];
 
         let response = self.signed_post("/fapi/v1/order", params)?;
@@ -624,6 +641,151 @@ impl BinanceTestnetClient {
             status,
             r#type: order_type,
         })
+    }
+
+    /// Fetch symbol info from exchange and update quantity precision fields.
+    ///
+    /// Extracts `MARKET_LOT_SIZE` (preferred for market orders) and `LOT_SIZE`
+    /// (fallback) filters to set `market_step_size`, `step_size`, and `min_qty`.
+    ///
+    /// This should be called after login and when changing symbols.
+    pub fn fetch_symbol_info(&mut self, symbol: &str) {
+        let url = format!(
+            "{}{}?symbol={}",
+            self.base_url, "/fapi/v1/exchangeInfo", symbol.to_uppercase()
+        );
+        
+        let result = self.http.get(&url).send();
+        match result {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                match resp.text() {
+                    Ok(body) => {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                            // Navigate to filters
+                            if let Some(symbols) = json.get("symbols").and_then(|s| s.as_array()) {
+                                for sym in symbols {
+                                    if sym.get("symbol").and_then(|v| v.as_str()) == Some(&symbol.to_uppercase()) {
+                                        if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
+                                            // Scan all filters to extract both MARKET_LOT_SIZE and LOT_SIZE
+                                            let mut lot_step: Option<f64> = None;
+                                            let mut lot_min: Option<f64> = None;
+                                            let mut market_step: Option<f64> = None;
+                                            let mut market_min: Option<f64> = None;
+
+                                            for filter in filters {
+                                                let filter_type = filter.get("filterType")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
+
+                                                match filter_type {
+                                                    "LOT_SIZE" => {
+                                                        lot_step = filter.get("stepSize")
+                                                            .and_then(|v| v.as_str())
+                                                            .and_then(|s| s.parse::<f64>().ok())
+                                                            .filter(|&v| v > 0.0);
+                                                        lot_min = filter.get("minQty")
+                                                            .and_then(|v| v.as_str())
+                                                            .and_then(|s| s.parse::<f64>().ok())
+                                                            .filter(|&v| v > 0.0);
+                                                    }
+                                                    "MARKET_LOT_SIZE" => {
+                                                        market_step = filter.get("stepSize")
+                                                            .and_then(|v| v.as_str())
+                                                            .and_then(|s| s.parse::<f64>().ok())
+                                                            .filter(|&v| v > 0.0);
+                                                        market_min = filter.get("minQty")
+                                                            .and_then(|v| v.as_str())
+                                                            .and_then(|s| s.parse::<f64>().ok())
+                                                            .filter(|&v| v > 0.0);
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+
+                                            // Apply: prefer MARKET_LOT_SIZE, fall back to LOT_SIZE
+                                            if let Some(step) = market_step {
+                                                self.market_step_size = step;
+                                            } else if let Some(step) = lot_step {
+                                                self.market_step_size = step;
+                                            }
+                                            if let Some(step) = lot_step {
+                                                self.step_size = step;
+                                            }
+                                            // min_qty: prefer MARKET_LOT_SIZE, fall back to LOT_SIZE
+                                            if let Some(min) = market_min {
+                                                self.min_qty = min;
+                                            } else if let Some(min) = lot_min {
+                                                self.min_qty = min;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            self.log("GET", "/fapi/v1/exchangeInfo", Some(status), "Symbol info fetched", false);
+                        }
+                    }
+                    Err(e) => {
+                        self.log("GET", "/fapi/v1/exchangeInfo", Some(status), &format!("Failed to read response: {}", e), true);
+                    }
+                }
+            }
+            Err(e) => {
+                self.log("GET", "/fapi/v1/exchangeInfo", None, &format!("Request failed: {}", e), true);
+            }
+        }
+    }
+
+    /// Round quantity to the symbol's market_step_size and format without trailing zeros.
+    ///
+    /// Uses MARKET_LOT_SIZE stepSize (preferred) or LOT_SIZE stepSize (fallback).
+    ///
+    /// For example, with market_step_size=0.001:
+    ///   0.0049999999 -> "0.005"
+    ///   1.23456 -> "1.234"
+    fn format_quantity(&self, quantity: f64) -> String {
+        if self.market_step_size <= 0.0 {
+            return format!("{}", quantity);
+        }
+        
+        // Calculate decimal places from market_step_size
+        let decimals = if self.market_step_size >= 1.0 {
+            0
+        } else {
+            let s = format!("{}", self.market_step_size);
+            // Find decimal places from string representation
+            if let Some(dot_pos) = s.find('.') {
+                let fractional = s[dot_pos + 1..].trim_end_matches('0');
+                fractional.len()
+            } else {
+                0
+            }
+        };
+        
+        // Round to market_step_size
+        let rounded = (quantity / self.market_step_size).round() * self.market_step_size;
+        
+        // Format with the correct number of decimal places, then strip trailing zeros
+        let formatted = format!("{:.prec$}", rounded, prec = decimals);
+        // Strip trailing zeros after decimal point, but keep at least one decimal if decimals > 0
+        if decimals > 0 {
+            let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+            // If we stripped everything after the dot, add back a single "0" for the required precision
+            if !trimmed.contains('.') && decimals > 0 {
+                // This means the value is an integer but step_size requires decimals
+                format!("{}.", trimmed)
+            } else {
+                trimmed.to_string()
+            }
+        } else {
+            format!("{:.0}", rounded)
+        }
+    }
+
+    /// Get the current step_size for quantity precision.
+    pub fn step_size(&self) -> f64 {
+        self.step_size
     }
 
     /// Get user trade history for a symbol.
