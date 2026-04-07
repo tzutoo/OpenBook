@@ -348,6 +348,14 @@ pub struct OrderBookApp {
     last_instant_score: f64,
     _signal_log_scroll: f32,
     _trade_log_scroll: f32,
+    // -- Binance Testnet execution --
+    logged_in: bool,
+    login_key_input: String,
+    login_secret_input: String,
+    login_error: Option<String>,
+    login_connecting: bool,
+    binance_client: Option<crate::execution::BinanceTestnetClient>,
+    show_api_log: bool,
 }
 
 struct AppPaneRenderer<'a> {
@@ -532,6 +540,13 @@ impl OrderBookApp {
             last_instant_score: 0.0,
             _signal_log_scroll: 0.0,
             _trade_log_scroll: 0.0,
+            logged_in: false,
+            login_key_input: String::new(),
+            login_secret_input: String::new(),
+            login_error: None,
+            login_connecting: false,
+            binance_client: None,
+            show_api_log: false,
         }
     }
 
@@ -782,6 +797,14 @@ impl eframe::App for OrderBookApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
+
+        // Login gate: show login dialog if not authenticated
+        if !self.logged_in {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            self.render_login_screen(ctx, frame);
+            self.perf_stats.record_frame(frame_start.elapsed());
+            return;
+        }
 
         let repaint_ms =
             if self.last_interaction_time.elapsed() < Duration::from_millis(INTERACTION_DECAY_MS) {
@@ -1084,6 +1107,31 @@ impl eframe::App for OrderBookApp {
                     egui::RichText::new(format!("{} {}", status_icon, state.status_msg))
                         .color(status_color),
                 );
+
+                ui.separator();
+
+                // API Log toggle
+                let error_count = self.binance_client
+                    .as_ref()
+                    .map(|c| c.error_log().iter().filter(|e| e.is_error).count())
+                    .unwrap_or(0);
+                let api_btn_text = if error_count > 0 {
+                    format!("API Log [{}]", error_count)
+                } else {
+                    "API Log".to_string()
+                };
+                let api_btn_color = if self.show_api_log {
+                    egui::Color32::from_rgb(50, 255, 100)
+                } else if error_count > 0 {
+                    ASK_COLOR
+                } else {
+                    egui::Color32::GRAY
+                };
+                if ui.button(
+                    egui::RichText::new(api_btn_text).color(api_btn_color).small()
+                ).clicked() {
+                    self.show_api_log = !self.show_api_log;
+                }
 
                 // Right-aligned info
                 let history_span_secs = state
@@ -1671,6 +1719,9 @@ impl eframe::App for OrderBookApp {
         if tree_edited {
             self.layout_dirty = true;
         }
+
+        // API error log window (toggleable)
+        self.render_api_log(ctx);
 
         self.perf_stats.record_frame(frame_start.elapsed());
     }
@@ -4093,6 +4144,276 @@ impl OrderBookApp {
             egui::FontId::proportional(9.0),
             egui::Color32::GRAY,
         );
+    }
+
+    fn render_login_screen(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let screen = ctx.input(|i| i.viewport_rect());
+        let dialog_width = 420.0;
+        let dialog_height = 280.0;
+        let dialog_rect = egui::Rect::from_center_size(
+            screen.center(),
+            egui::vec2(dialog_width, dialog_height),
+        );
+
+        // Dim background
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        painter.rect_filled(screen, 0.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 200));
+
+        egui::Area::new(egui::Id::new("login_dialog"))
+            .fixed_pos(dialog_rect.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_width(dialog_width);
+                ui.set_height(dialog_height);
+
+                // Dialog background
+                let bg_rect = ui.available_rect_before_wrap();
+                let painter = ui.painter();
+                painter.rect_filled(bg_rect, 8.0, egui::Color32::from_rgb(22, 27, 34));
+                painter.rect_stroke(bg_rect, 8.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 54, 61)), egui::StrokeKind::Middle);
+
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("BINANCE TESTNET")
+                            .color(egui::Color32::from_rgb(255, 200, 50))
+                            .strong()
+                            .size(18.0),
+                    );
+                    ui.label(
+                        egui::RichText::new("Enter your API credentials to continue")
+                            .color(egui::Color32::GRAY)
+                            .size(12.0),
+                    );
+                });
+
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(32.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("API Key")
+                                .color(egui::Color32::from_rgb(140, 150, 170))
+                                .size(11.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.login_key_input)
+                                .desired_width(340.0)
+                                .password(false)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("Enter API key..."),
+                        );
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(32.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Secret Key")
+                                .color(egui::Color32::from_rgb(140, 150, 170))
+                                .size(11.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.login_secret_input)
+                                .desired_width(340.0)
+                                .password(true)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("Enter secret key..."),
+                        );
+                    });
+                });
+
+                // Error message
+                if let Some(ref error) = self.login_error {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(32.0);
+                        ui.label(
+                            egui::RichText::new(error)
+                                .color(ASK_COLOR)
+                                .size(11.0),
+                        );
+                    });
+                }
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(32.0);
+                    let login_text = if self.login_connecting {
+                        "Connecting..."
+                    } else {
+                        "Login"
+                    };
+                    let login_response = ui.add_sized(
+                        egui::vec2(170.0, 32.0),
+                        egui::Button::new(
+                            egui::RichText::new(login_text)
+                                .strong()
+                                .size(13.0),
+                        ),
+                    );
+
+                    if login_response.clicked() && !self.login_connecting {
+                        let key = self.login_key_input.trim().to_string();
+                        let secret = self.login_secret_input.trim().to_string();
+                        if key.is_empty() || secret.is_empty() {
+                            self.login_error = Some("API Key and Secret Key are required".to_string());
+                        } else {
+                            self.login_error = None;
+                            let client = crate::execution::BinanceTestnetClient::new(key, secret);
+                            match client.test_connection() {
+                                Ok(_) => {
+                                    self.binance_client = Some(client);
+                                    self.logged_in = true;
+                                    // Sync account info after login
+                                    if let Some(ref bc) = self.binance_client {
+                                        if let Ok(balance) = bc.get_balance() {
+                                            self.initial_equity = balance;
+                                            self.strategy_engine = crate::strategy::StrategyEngine::new(
+                                                crate::strategy::StrategyConfig {
+                                                    symbol: self.active_symbol.clone(),
+                                                    ..Default::default()
+                                                },
+                                                balance,
+                                            );
+                                            self.equity_history.clear();
+                                            self.equity_history.push((0, balance));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    self.login_error = Some(e);
+                                }
+                            }
+                            self.login_connecting = false;
+                        }
+                    }
+
+                    let exit_response = ui.add_sized(
+                        egui::vec2(170.0, 32.0),
+                        egui::Button::new(
+                            egui::RichText::new("Exit")
+                                .color(egui::Color32::WHITE)
+                                .size(13.0),
+                        )
+                        .fill(egui::Color32::from_rgb(60, 20, 20)),
+                    );
+                    if exit_response.clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+    }
+
+    fn render_api_log(&mut self, ctx: &egui::Context) {
+        if !self.show_api_log {
+            return;
+        }
+
+        egui::Window::new("API Log")
+            .id(egui::Id::new("api_log_window"))
+            .default_width(600.0)
+            .default_height(300.0)
+            .resizable(true)
+            .collapsible(false)
+            .open(&mut self.show_api_log)
+            .show(ctx, |ui| {
+                // Header with clear button
+                ui.horizontal(|ui| {
+                    let entry_count = self.binance_client
+                        .as_ref()
+                        .map(|c| c.error_log().len())
+                        .unwrap_or(0);
+                    ui.label(
+                        egui::RichText::new(format!("{} entries", entry_count))
+                            .color(egui::Color32::GRAY)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Clear").clicked() {
+                            if let Some(ref client) = self.binance_client {
+                                client.clear_error_log();
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+
+                // Log entries
+                egui::ScrollArea::vertical()
+                    .id_salt("api_log_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let entries = self.binance_client
+                            .as_ref()
+                            .map(|c| c.error_log())
+                            .unwrap_or_default();
+
+                        if entries.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(20.0);
+                                ui.label(
+                                    egui::RichText::new("No API calls recorded")
+                                        .color(egui::Color32::GRAY)
+                                        .small(),
+                                );
+                            });
+                            return;
+                        }
+
+                        // Table header
+                        ui.horizontal(|ui| {
+                            let hc = egui::Color32::from_rgb(100, 110, 130);
+                            ui.add_sized([80.0, 14.0], egui::Label::new(
+                                egui::RichText::new("TIME").color(hc).size(9.0)));
+                            ui.add_sized([45.0, 14.0], egui::Label::new(
+                                egui::RichText::new("METHOD").color(hc).size(9.0)));
+                            ui.add_sized([120.0, 14.0], egui::Label::new(
+                                egui::RichText::new("ENDPOINT").color(hc).size(9.0)));
+                            ui.add_sized([35.0, 14.0], egui::Label::new(
+                                egui::RichText::new("CODE").color(hc).size(9.0)));
+                            ui.add_sized([280.0, 14.0], egui::Label::new(
+                                egui::RichText::new("DETAIL").color(hc).size(9.0)));
+                        });
+                        ui.separator();
+
+                        // Show newest first
+                        for entry in entries.iter().rev() {
+                            ui.horizontal(|ui| {
+                                let time_str = format_hms_millis(entry.timestamp_ms);
+                                let row_color = if entry.is_error {
+                                    ASK_COLOR
+                                } else {
+                                    egui::Color32::from_rgb(100, 110, 130)
+                                };
+
+                                ui.add_sized([80.0, 14.0], egui::Label::new(
+                                    egui::RichText::new(time_str).color(row_color).size(9.0)));
+                                ui.add_sized([45.0, 14.0], egui::Label::new(
+                                    egui::RichText::new(&entry.method).color(row_color).size(9.0)));
+                                ui.add_sized([120.0, 14.0], egui::Label::new(
+                                    egui::RichText::new(&entry.endpoint).color(row_color).size(9.0)));
+
+                                let code_str = entry.status_code
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                                ui.add_sized([35.0, 14.0], egui::Label::new(
+                                    egui::RichText::new(code_str).color(row_color).size(9.0)));
+
+                                // Truncate long error messages
+                                let detail = if entry.error_body.len() > 60 {
+                                    format!("{}...", &entry.error_body[..57])
+                                } else {
+                                    entry.error_body.clone()
+                                };
+                                ui.add_sized([280.0, 14.0], egui::Label::new(
+                                    egui::RichText::new(detail).color(row_color).size(9.0)));
+                            });
+                        }
+                    });
+            });
     }
 }
 

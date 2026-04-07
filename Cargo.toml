@@ -17,7 +17,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
 ordered-float = "4.0"
-reqwest = { version = "0.11", features = ["json", "native-tls"] }
+reqwest = { version = "0.11", features = ["json", "native-tls", "blocking"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+percent-encoding = "2.3"
 eframe = { version = "0.33", features = ["persistence"] }
 egui_tiles = { version = "0.14", features = ["serde"] }
 dhat = { version = "0.3", optional = true }

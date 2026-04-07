@@ -4,6 +4,7 @@ mod signal;
 mod strategy;
 mod ui;
 mod workspace;
+mod execution;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
