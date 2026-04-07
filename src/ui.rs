@@ -1678,9 +1678,9 @@ impl eframe::App for OrderBookApp {
 
 impl OrderBookApp {
     fn compute_instant_score(sample: &SignalSample) -> f64 {
-        let absorption_direction = if sample.absorption_score > 0.7 && sample.fk_net_direction < 0.0 {
+        let absorption_direction = if sample.absorption_score > 0.4 && sample.fk_net_direction < 0.0 {
             sample.absorption_score
-        } else if sample.absorption_score > 0.7 && sample.fk_net_direction > 0.0 {
+        } else if sample.absorption_score > 0.4 && sample.fk_net_direction > 0.0 {
             -sample.absorption_score
         } else {
             0.0
@@ -3789,6 +3789,48 @@ impl OrderBookApp {
                     CYAN_COLOR);
                 label_row(ui, "Buy Vol %", &format!("{:.1}%", bar.avg_buy_volume_pct),
                     if bar.avg_buy_volume_pct > 50.0 { BID_COLOR } else { ASK_COLOR });
+
+                // Entry proximity indicator
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("ENTRY PROXIMITY").color(egui::Color32::GRAY).small());
+
+                let long_gap = (0.25 - score).max(0.0);
+                let short_gap = (score - (-0.25)).max(0.0);
+                let score_gap = if score >= 0.0 { long_gap } else { short_gap };
+                let gap_color = if score_gap <= 0.0 { BID_COLOR } else if score_gap < 0.1 { AMBER_COLOR } else { ASK_COLOR };
+                label_row(ui, "Score Gap", &format!("{:.3}", score_gap), gap_color);
+
+                let fk_abs = bar.fk_net_direction_mean.abs();
+                let momentum_met = fk_abs >= 0.1;
+                let momentum_color = if momentum_met { BID_COLOR } else { egui::Color32::from_rgb(100, 80, 40) };
+                label_row(ui, "Momentum", &format!(
+                    "{}{}",
+                    if momentum_met { "✓ " } else { "  " },
+                    format!("{:.3}/0.1", fk_abs)
+                ), momentum_color);
+
+                let abs_val = bar.absorption_score_max;
+                let reversal_met = abs_val >= 0.4;
+                let reversal_color = if reversal_met { BID_COLOR } else { egui::Color32::from_rgb(100, 80, 40) };
+                label_row(ui, "Reversal", &format!(
+                    "{}{}",
+                    if reversal_met { "✓ " } else { "  " },
+                    format!("{:.3}/0.4", abs_val)
+                ), reversal_color);
+
+                let any_confirm = momentum_met || reversal_met;
+                let ready = score_gap <= 0.0 && any_confirm;
+                let ready_color = if ready { BID_COLOR } else { egui::Color32::from_rgb(60, 65, 75) };
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("READY").color(egui::Color32::from_rgb(90, 95, 105)).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ready_text = if ready { "[GO]" } else { "[--]" };
+                        ui.label(egui::RichText::new(ready_text).color(ready_color).strong().size(12.0));
+                    });
+                });
             }
         });
     }
@@ -3812,19 +3854,21 @@ impl OrderBookApp {
                 // Table header
                 ui.horizontal(|ui| {
                     let header_color = egui::Color32::from_rgb(100, 110, 130);
-                    ui.add_sized([28.0, 16.0], egui::Label::new(
+                    ui.add_sized([22.0, 16.0], egui::Label::new(
                         egui::RichText::new("#").color(header_color).size(10.0)));
-                    ui.add_sized([36.0, 16.0], egui::Label::new(
+                    ui.add_sized([72.0, 16.0], egui::Label::new(
+                        egui::RichText::new("TIME").color(header_color).size(10.0)));
+                    ui.add_sized([34.0, 16.0], egui::Label::new(
                         egui::RichText::new("SIDE").color(header_color).size(10.0)));
-                    ui.add_sized([65.0, 16.0], egui::Label::new(
+                    ui.add_sized([62.0, 16.0], egui::Label::new(
                         egui::RichText::new("ENTRY").color(header_color).size(10.0)));
-                    ui.add_sized([65.0, 16.0], egui::Label::new(
+                    ui.add_sized([62.0, 16.0], egui::Label::new(
                         egui::RichText::new("EXIT").color(header_color).size(10.0)));
-                    ui.add_sized([55.0, 16.0], egui::Label::new(
+                    ui.add_sized([52.0, 16.0], egui::Label::new(
                         egui::RichText::new("PnL").color(header_color).size(10.0)));
-                    ui.add_sized([42.0, 16.0], egui::Label::new(
+                    ui.add_sized([40.0, 16.0], egui::Label::new(
                         egui::RichText::new("PnL%").color(header_color).size(10.0)));
-                    ui.add_sized([55.0, 16.0], egui::Label::new(
+                    ui.add_sized([60.0, 16.0], egui::Label::new(
                         egui::RichText::new("REASON").color(header_color).size(10.0)));
                 });
                 ui.separator();
@@ -3832,8 +3876,12 @@ impl OrderBookApp {
                 // Show trades newest first
                 for trade in trades.iter().rev() {
                     ui.horizontal(|ui| {
-                        ui.add_sized([28.0, 16.0], egui::Label::new(
+                        ui.add_sized([22.0, 16.0], egui::Label::new(
                             egui::RichText::new(format!("{}", trade.id)).color(egui::Color32::GRAY).size(10.0)));
+
+                        let time_str = format_hms_millis(trade.entry_time_ms);
+                        ui.add_sized([72.0, 16.0], egui::Label::new(
+                            egui::RichText::new(time_str).color(egui::Color32::from_rgb(140, 150, 170)).size(10.0)));
                         
                         let side_text = match trade.side {
                             crate::strategy::Side::Buy => "BUY",
@@ -3843,25 +3891,25 @@ impl OrderBookApp {
                             crate::strategy::Side::Buy => BID_COLOR,
                             crate::strategy::Side::Sell => ASK_COLOR,
                         };
-                        ui.add_sized([36.0, 16.0], egui::Label::new(
+                        ui.add_sized([34.0, 16.0], egui::Label::new(
                             egui::RichText::new(side_text).color(side_color).size(10.0)));
                         
-                        ui.add_sized([65.0, 16.0], egui::Label::new(
+                        ui.add_sized([62.0, 16.0], egui::Label::new(
                             egui::RichText::new(format!("{:.2}", trade.entry_price)).color(egui::Color32::WHITE).size(10.0)));
                         
-                        ui.add_sized([65.0, 16.0], egui::Label::new(
+                        ui.add_sized([62.0, 16.0], egui::Label::new(
                             egui::RichText::new(format!("{:.2}", trade.exit_price)).color(egui::Color32::WHITE).size(10.0)));
                         
                         let pnl_color = if trade.pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
                         let pnl_str = format!("{:+.2}", trade.pnl);
-                        ui.add_sized([55.0, 16.0], egui::Label::new(
+                        ui.add_sized([52.0, 16.0], egui::Label::new(
                             egui::RichText::new(pnl_str).color(pnl_color).strong().size(10.0)));
                         
                         let pnl_pct_str = format!("{:+.2}%", trade.pnl_pct);
-                        ui.add_sized([42.0, 16.0], egui::Label::new(
+                        ui.add_sized([40.0, 16.0], egui::Label::new(
                             egui::RichText::new(pnl_pct_str).color(pnl_color).size(10.0)));
                         
-                        ui.add_sized([55.0, 16.0], egui::Label::new(
+                        ui.add_sized([60.0, 16.0], egui::Label::new(
                             egui::RichText::new(&trade.exit_reason).color(egui::Color32::from_rgb(130, 140, 160)).size(9.0)));
                     });
                 }
@@ -3884,11 +3932,13 @@ impl OrderBookApp {
             return;
         }
         
-        let padding = 8.0;
-        let plot_left = available_rect.left() + padding;
-        let plot_right = available_rect.right() - padding;
-        let plot_top = available_rect.top() + padding;
-        let plot_bottom = available_rect.bottom() - padding;
+        let padding_side = 8.0;
+        let padding_top = 8.0;
+        let padding_bottom = 20.0; // Extra space for x-axis time labels
+        let plot_left = available_rect.left() + padding_side;
+        let plot_right = available_rect.right() - padding_side;
+        let plot_top = available_rect.top() + padding_top;
+        let plot_bottom = available_rect.bottom() - padding_bottom;
         let plot_width = plot_right - plot_left;
         let plot_height = plot_bottom - plot_top;
         
@@ -3912,7 +3962,7 @@ impl OrderBookApp {
         let max_eq = equities.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let eq_range = (max_eq - min_eq).max(0.01);
         
-        // Draw initial equity line
+        // Draw initial equity reference line
         if min_eq <= self.initial_equity && self.initial_equity <= max_eq {
             let initial_y = plot_bottom - ((self.initial_equity - min_eq) / eq_range) as f32 * plot_height;
             painter.line_segment(
@@ -3946,7 +3996,7 @@ impl OrderBookApp {
             );
         }
         
-        // Labels
+        // Y-axis labels (left side)
         painter.text(
             egui::pos2(plot_left, plot_top - 2.0),
             egui::Align2::LEFT_BOTTOM,
@@ -3961,6 +4011,7 @@ impl OrderBookApp {
             egui::FontId::proportional(10.0),
             egui::Color32::from_rgb(120, 130, 145),
         );
+        // Current equity label (right side, top)
         painter.text(
             egui::pos2(plot_right, plot_top - 2.0),
             egui::Align2::RIGHT_BOTTOM,
@@ -3968,6 +4019,43 @@ impl OrderBookApp {
             egui::FontId::proportional(10.0),
             line_color,
         );
+        
+        // X-axis time labels
+        let time_color = egui::Color32::from_rgb(100, 110, 130);
+        let label_y = plot_bottom + 4.0;
+        
+        if n > 1 {
+            // Show up to 5 time labels: first, last, and evenly spaced intermediates
+            let max_labels = 5usize;
+            let num_labels = n.min(max_labels);
+            let label_indices: Vec<usize> = if num_labels <= 2 {
+                (0..num_labels).collect()
+            } else {
+                (0..num_labels).map(|i| {
+                    (i as f64 * (n - 1) as f64 / (num_labels - 1) as f64).round() as usize
+                }).collect()
+            };
+            
+            for (label_idx, &data_idx) in label_indices.iter().enumerate() {
+                let (ts_ms, _) = self.equity_history[data_idx];
+                let time_str = format_hms_millis(ts_ms);
+                let x = plot_left + (data_idx as f64 / (n - 1) as f64) as f32 * plot_width;
+                let align = if label_idx == 0 {
+                    egui::Align2::LEFT_BOTTOM
+                } else if label_idx == label_indices.len() - 1 {
+                    egui::Align2::RIGHT_BOTTOM
+                } else {
+                    egui::Align2::CENTER_BOTTOM
+                };
+                painter.text(
+                    egui::pos2(x, label_y),
+                    align,
+                    time_str,
+                    egui::FontId::proportional(9.0),
+                    time_color,
+                );
+            }
+        }
     }
 
     fn render_color_legend(&self, ui: &mut egui::Ui, width: f32, height: f32) {

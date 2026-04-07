@@ -138,18 +138,18 @@ pub fn build_default_tree() -> Tree<PaneKind> {
         &[(order_book, 0.65), (market_impact, 0.35)],
     );
 
-    let right_strategy = tiles.insert_vertical_tile(vec![strategy, trade_log]);
+    let right_charts = tiles.insert_vertical_tile(vec![trade_log, equity_curve]);
     set_linear_shares(
         &mut tiles,
-        right_strategy,
-        &[(strategy, 0.55), (trade_log, 0.45)],
+        right_charts,
+        &[(trade_log, 0.80), (equity_curve, 0.20)],
     );
 
-    let right = tiles.insert_vertical_tile(vec![right_strategy, equity_curve]);
+    let right = tiles.insert_horizontal_tile(vec![strategy, right_charts]);
     set_linear_shares(
         &mut tiles,
         right,
-        &[(right_strategy, 0.75), (equity_curve, 0.25)],
+        &[(strategy, 0.45), (right_charts, 0.55)],
     );
 
     let root = tiles.insert_horizontal_tile(vec![left, middle, right]);

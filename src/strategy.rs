@@ -567,9 +567,9 @@ impl Default for StrategyConfig {
         Self {
             symbol: String::new(),
             bar_duration_ms: 60_000,
-            long_entry_threshold: 0.5,
-            short_entry_threshold: -0.5,
-            min_absorption_for_reversal: 0.7,
+            long_entry_threshold: 0.25,
+            short_entry_threshold: -0.25,
+            min_absorption_for_reversal: 0.4,
             long_exit_threshold: -0.2,
             short_exit_threshold: 0.2,
             weight_fk_direction: 0.30,
@@ -685,13 +685,22 @@ impl StrategyEngine {
 
             let exit_signal = self.check_exit(bar);
             if exit_signal != Signal::Hold {
+                // Determine exit reason by re-checking conditions
+                let reason = self.determine_exit_reason(bar);
+                self.close_position(bar.close_price, bar.bar_end_ms, reason);
                 return exit_signal;
             }
             return Signal::Hold;
         }
 
         // If flat, check entry conditions
-        self.check_entry(Self::compute_score(bar), bar)
+        let entry_signal = self.check_entry(Self::compute_score(bar), bar);
+        match entry_signal {
+            Signal::GoLong => self.open_position(Side::Buy, bar.close_price, bar.bar_end_ms),
+            Signal::GoShort => self.open_position(Side::Sell, bar.close_price, bar.bar_end_ms),
+            _ => {}
+        }
+        entry_signal
     }
 
     /// Compute the composite score from an aggregated bar.
@@ -707,11 +716,11 @@ impl StrategyEngine {
     pub fn compute_score(bar: &AggregatedBar) -> f64 {
         // Absorption direction logic:
         // High absorption with contrary flow = reversal signal
-        let absorption_direction = if bar.absorption_score_max > 0.7 && bar.fk_net_direction_mean < 0.0
+        let absorption_direction = if bar.absorption_score_max > 0.4 && bar.fk_net_direction_mean < 0.0
         {
             // Buy absorption reversal: selling being absorbed = bullish
             bar.absorption_score_max
-        } else if bar.absorption_score_max > 0.7 && bar.fk_net_direction_mean > 0.0 {
+        } else if bar.absorption_score_max > 0.4 && bar.fk_net_direction_mean > 0.0 {
             // Sell absorption reversal: buying being absorbed = bearish
             -bar.absorption_score_max
         } else {
@@ -749,7 +758,7 @@ impl StrategyEngine {
         // Check long entry
         if score > self.config.long_entry_threshold {
             let has_absorption = bar.absorption_score_max >= self.config.min_absorption_for_reversal;
-            let has_momentum = bar.fk_net_direction_mean > 0.2;
+            let has_momentum = bar.fk_net_direction_mean > 0.1;
 
             if has_absorption || has_momentum {
                 return Signal::GoLong;
@@ -759,7 +768,7 @@ impl StrategyEngine {
         // Check short entry
         if score < self.config.short_entry_threshold {
             let has_absorption = bar.absorption_score_max >= self.config.min_absorption_for_reversal;
-            let has_momentum = bar.fk_net_direction_mean < -0.2;
+            let has_momentum = bar.fk_net_direction_mean < -0.1;
 
             if has_absorption || has_momentum {
                 return Signal::GoShort;
@@ -864,6 +873,64 @@ impl StrategyEngine {
         }
 
         Signal::Hold
+    }
+
+    /// Determine the reason for an exit signal by checking which condition triggered.
+    fn determine_exit_reason(&self, bar: &AggregatedBar) -> &'static str {
+        if self.position.is_flat() || self.position.quantity == 0.0 {
+            return "unknown";
+        }
+
+        let entry_value = self.position.entry_price * self.position.quantity;
+        if entry_value == 0.0 {
+            return "unknown";
+        }
+
+        let pnl_pct = (self.position.unrealized_pnl / entry_value) * 100.0;
+        let max_fav_pct = (self.position.max_favorable / entry_value) * 100.0;
+
+        // 1. Stop loss
+        if pnl_pct <= -self.config.stop_loss_pct {
+            return "stop_loss";
+        }
+
+        // 2. Take profit
+        if pnl_pct >= self.config.take_profit_pct {
+            return "take_profit";
+        }
+
+        // 3. Trailing stop
+        if max_fav_pct >= self.config.trailing_stop_activation_pct {
+            let trailing_stop_pct = self.config.trailing_stop_distance_pct;
+            match self.position.state {
+                PositionState::Long => {
+                    let best_price =
+                        self.position.entry_price + self.position.max_favorable / self.position.quantity;
+                    let trailing_stop_price = best_price * (1.0 - trailing_stop_pct / 100.0);
+                    if bar.close_price <= trailing_stop_price {
+                        return "trailing_stop";
+                    }
+                }
+                PositionState::Short => {
+                    let worst_price =
+                        self.position.entry_price - self.position.max_favorable / self.position.quantity;
+                    let trailing_stop_price = worst_price * (1.0 + trailing_stop_pct / 100.0);
+                    if bar.close_price >= trailing_stop_price {
+                        return "trailing_stop";
+                    }
+                }
+                PositionState::Flat => {}
+            }
+        }
+
+        // 4. Time stop
+        let hold_duration = bar.bar_end_ms.saturating_sub(self.position.entry_time_ms);
+        if hold_duration > self.config.time_stop_ms && self.position.unrealized_pnl <= 0.0 {
+            return "time_stop";
+        }
+
+        // 5. Signal reversal
+        "signal_reversal"
     }
 
     /// Open a new position.
@@ -1893,5 +1960,59 @@ mod tests {
         let empty: Vec<f64> = vec![];
         let slope = SignalBarAggregator::linear_slope(&empty);
         assert_eq!(slope, 0.0, "Empty vec should have zero slope");
+    }
+
+    #[test]
+    fn test_on_bar_opens_position_and_records_trade() {
+        let config = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            ..Default::default()
+        };
+        let mut engine = StrategyEngine::new(config, 10_000.0);
+
+        // Entry: bullish bar should open a long position
+        let entry_bar = make_bullish_bar(60_000);
+        let signal = engine.on_bar(&entry_bar);
+        assert_eq!(signal, Signal::GoLong);
+        assert!(!engine.position().is_flat(), "Position should be open after GoLong");
+        assert_eq!(engine.position().state, PositionState::Long);
+        assert_eq!(engine.position().entry_price, entry_bar.close_price);
+        assert_eq!(engine.trade_history().len(), 0, "No trade recorded until exit");
+
+        // Exit: bearish bar should close the long (score < long_exit_threshold = -0.2)
+        let exit_bar = make_bearish_bar(90_000);
+        let exit_signal = engine.on_bar(&exit_bar);
+        assert_eq!(exit_signal, Signal::ExitLong);
+        assert!(engine.position().is_flat(), "Position should be flat after exit");
+        assert_eq!(engine.trade_history().len(), 1, "One trade should be recorded");
+
+        let trade = &engine.trade_history()[0];
+        assert_eq!(trade.side, Side::Buy);
+        assert_eq!(trade.entry_price, entry_bar.close_price);
+        assert_eq!(trade.exit_price, exit_bar.close_price);
+        assert!(!trade.exit_reason.is_empty());
+    }
+
+    #[test]
+    fn test_on_bar_short_entry_and_exit() {
+        let config = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            ..Default::default()
+        };
+        let mut engine = StrategyEngine::new(config, 10_000.0);
+
+        // Entry: bearish bar should open a short position
+        let entry_bar = make_bearish_bar(60_000);
+        let signal = engine.on_bar(&entry_bar);
+        assert_eq!(signal, Signal::GoShort);
+        assert_eq!(engine.position().state, PositionState::Short);
+
+        // Exit: bullish bar should close the short (score > short_exit_threshold = 0.2)
+        let exit_bar = make_bullish_bar(90_000);
+        let exit_signal = engine.on_bar(&exit_bar);
+        assert_eq!(exit_signal, Signal::ExitShort);
+        assert!(engine.position().is_flat());
+        assert_eq!(engine.trade_history().len(), 1);
+        assert_eq!(engine.trade_history()[0].side, Side::Sell);
     }
 }
