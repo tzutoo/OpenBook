@@ -816,6 +816,13 @@ impl OrderBookApp {
 
         let symbol = self.active_symbol.to_uppercase();
 
+        // Sync real balance from Binance
+        if let Ok(balance) = client.get_balance() {
+            if balance > 0.0 {
+                self.initial_equity = balance;
+            }
+        }
+
         // Fetch all user trades for this symbol
         match client.fetch_all_user_trades(&symbol) {
             Ok(trades) => {

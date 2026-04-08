@@ -40,6 +40,8 @@ pub struct ApiLogEntry {
 pub struct AccountInfo {
     /// Total wallet balance across all assets (in USDT value).
     pub total_wallet_balance: f64,
+    /// Total margin balance (wallet + unrealized PnL) — matches Binance UI "Margin Balance".
+    pub total_margin_balance: f64,
     /// Available balance for trading.
     pub available_balance: f64,
     /// Total unrealized profit/loss.
@@ -650,6 +652,7 @@ impl BinanceTestnetClient {
         let response = self.signed_get("/fapi/v2/account", vec![])?;
 
         let total_wallet_balance = extract_f64(&response, "totalWalletBalance")?;
+        let total_margin_balance = extract_f64(&response, "totalMarginBalance")?;
         let available_balance = extract_f64(&response, "availableBalance")?;
         let unrealized_pnl = extract_f64(&response, "totalUnrealizedProfit")?;
 
@@ -672,6 +675,7 @@ impl BinanceTestnetClient {
 
         Ok(AccountInfo {
             total_wallet_balance,
+            total_margin_balance,
             available_balance,
             unrealized_pnl,
             assets,
@@ -1021,16 +1025,8 @@ impl BinanceTestnetClient {
     /// Convenience method that calls get_account and returns the USDT available balance.
     pub fn get_balance(&self) -> Result<f64, String> {
         let account = self.get_account()?;
-
-        // Find USDT in assets or use availableBalance from top level
-        for asset in &account.assets {
-            if asset.asset == "USDT" {
-                return Ok(asset.wallet_balance);
-            }
-        }
-
-        // Fallback to top-level available balance (already in USDT terms)
-        Ok(account.available_balance)
+        // Return totalMarginBalance — matches "Margin Balance" in Binance UI
+        Ok(account.total_margin_balance)
     }
 
     /// Get a copy of the current error log entries.
