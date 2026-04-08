@@ -80,6 +80,8 @@ pub struct SignalSample {
     // -- Derived signals -----------------------------------------------------
     pub absorption_score: f64,  // high when large fills don't move price
     pub aggression_shift: f64,  // change in fill:kill direction over short window
+    pub vd_buy_levels: u64,     // max levels moved by a single buy burst in last 1s
+    pub vd_sell_levels: u64,    // max levels moved by a single sell burst in last 1s
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +224,12 @@ impl SignalExtractor {
             self.config.aggression_shift_window_ms,
         );
 
+        let (vd_buy_levels, vd_sell_levels) = Self::liquidity_void_levels(
+            &state.micro_metrics,
+            now_ms,
+            self.config.trade_window_ms,
+        );
+
         SignalSample {
             timestamp_ms: now_ms,
             symbol: self.config.symbol.clone(),
@@ -250,6 +258,8 @@ impl SignalExtractor {
             buy_volume_pct_1s,
             absorption_score,
             aggression_shift,
+            vd_buy_levels,
+            vd_sell_levels,
         }
     }
 
@@ -579,6 +589,41 @@ impl SignalExtractor {
         // Positive means aggression shifted toward buying.
         late_dir - early_dir
     }
+
+    // -- Liquidity Void Extraction -------------------------------------------
+
+    /// Find the maximum levels moved by a single burst in the last `window_ms`.
+    /// 
+    /// Returns `(buy_levels, sell_levels)`.
+    fn liquidity_void_levels(
+        micro: &MicroMetrics,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> (u64, u64) {
+        let cutoff = now_ms.saturating_sub(window_ms);
+        let mut max_buy_levels = 0u64;
+        let mut max_sell_levels = 0u64;
+
+        for sample in &micro.fill_kill_history.samples {
+            if sample.timestamp_ms < cutoff {
+                continue;
+            }
+            match sample.direction {
+                BurstDirection::Buy => {
+                    if sample.levels_moved > max_buy_levels {
+                        max_buy_levels = sample.levels_moved;
+                    }
+                }
+                BurstDirection::Sell => {
+                    if sample.levels_moved > max_sell_levels {
+                        max_sell_levels = sample.levels_moved;
+                    }
+                }
+            }
+        }
+
+        (max_buy_levels, max_sell_levels)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +767,8 @@ mod tests {
             buy_volume_pct_1s: 55.0,
             absorption_score: 0.7,
             aggression_shift: 0.2,
+            vd_buy_levels: 0,
+            vd_sell_levels: 0,
         };
 
         let json = serde_json::to_string(&sample).expect("serialize");
@@ -800,6 +847,8 @@ mod tests {
                 buy_volume_pct_1s: 50.0,
                 absorption_score: 0.0,
                 aggression_shift: 0.0,
+                vd_buy_levels: 0,
+                vd_sell_levels: 0,
             };
             logger.write_sample(&sample).expect("write");
         }
