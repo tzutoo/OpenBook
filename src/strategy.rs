@@ -101,6 +101,14 @@ pub struct AggregatedBar {
     /// Linear regression slope of imbalance over samples (trend indicator).
     pub ob_imbalance_trend: f64,
 
+    // -- Spread & Session Trend --
+    /// Average spread in basis points.
+    pub avg_spread_bps: f64,
+    /// Final cumulative net quantity at bar close.
+    pub cum_net_qty_final: f64,
+    /// Final cumulative fill:kill ratio at bar close.
+    pub cum_ratio_final: f64,
+
     // -- Fill:Kill --
     /// Mean net fill:kill direction ([-1, 1], positive = buy-aggressive).
     pub fk_net_direction_mean: f64,
@@ -242,6 +250,11 @@ impl SignalBarAggregator {
         let ob_imbalance_min = ob_imbalances.iter().copied().fold(f64::INFINITY, f64::min);
         let ob_imbalance_trend = Self::linear_slope(&ob_imbalances);
 
+        // Spread & Session Trend
+        let avg_spread_bps = samples.iter().map(|s| s.spread_bps).sum::<f64>() / sample_count as f64;
+        let cum_net_qty_final = samples.last().unwrap().cum_net_qty;
+        let cum_ratio_final = samples.last().unwrap().cum_ratio;
+
         // Fill:Kill stats
         let fk_net_directions: Vec<f64> = samples.iter().map(|s| s.fk_net_direction).collect();
         let fk_net_direction_mean = fk_net_directions.iter().sum::<f64>() / sample_count as f64;
@@ -293,6 +306,9 @@ impl SignalBarAggregator {
             ob_imbalance_max,
             ob_imbalance_min,
             ob_imbalance_trend,
+            avg_spread_bps,
+            cum_net_qty_final,
+            cum_ratio_final,
             fk_net_direction_mean,
             fk_net_direction_max,
             fk_net_direction_min,
@@ -508,7 +524,7 @@ pub struct StrategyConfig {
     // -- General --
     /// Trading symbol (e.g., "BTCUSDT").
     pub symbol: String,
-    /// Bar duration in milliseconds for aggregation (default: 60_000 = 1 minute).
+    /// Bar duration in milliseconds for aggregation (default: 30_000 = 30 seconds).
     pub bar_duration_ms: u64,
 
     // -- Entry thresholds --
@@ -524,6 +540,16 @@ pub struct StrategyConfig {
     pub long_exit_threshold: f64,
     /// Composite score threshold to exit short (default: 0.2).
     pub short_exit_threshold: f64,
+
+    // -- Advanced Microstructure Filters --
+    /// Maximum allowed average spread in bps to enter a trade (default: 10.0).
+    pub max_spread_bps: f64,
+    /// Minimum ratio of opposite-side slippage vs same-side slippage (default: 1.2).
+    pub min_liquidity_skew_ratio: f64,
+    /// Maximum allowed adverse limit book trend (slope) to prevent spoofing traps (default: -0.05).
+    pub trend_divergence_threshold: f64,
+    /// Require cumulative session volume to align with trade direction (default: true).
+    pub enforce_macro_trend: bool,
 
     // -- Signal weights (for composite score) --
     /// Weight for fill:kill net direction (default: 0.30).
@@ -550,7 +576,7 @@ pub struct StrategyConfig {
     pub trailing_stop_activation_pct: f64,
     /// Trailing stop distance from peak as % (default: 0.08).
     pub trailing_stop_distance_pct: f64,
-    /// Exit if no profit after this duration in ms (default: 180_000 = 3 min).
+    /// Exit if no profit after this duration in ms (default: 90_000 = 1.5 min).
     pub time_stop_ms: u64,
     /// Maximum number of simultaneous open positions (default: 1).
     pub max_open_positions: usize,
@@ -568,12 +594,16 @@ impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
             symbol: String::new(),
-            bar_duration_ms: 60_000,
+            bar_duration_ms: 30_000,
             long_entry_threshold: 0.25,
             short_entry_threshold: -0.25,
             min_absorption_for_reversal: 0.4,
             long_exit_threshold: -0.2,
             short_exit_threshold: 0.2,
+            max_spread_bps: 10.0,
+            min_liquidity_skew_ratio: 1.2,
+            trend_divergence_threshold: -0.05,
+            enforce_macro_trend: true,
             weight_fk_direction: 0.30,
             weight_aggression_shift: 0.25,
             weight_ob_imbalance: 0.15,
@@ -585,7 +615,7 @@ impl Default for StrategyConfig {
             take_profit_pct: 0.30,
             trailing_stop_activation_pct: 0.15,
             trailing_stop_distance_pct: 0.08,
-            time_stop_ms: 180_000,
+            time_stop_ms: 90_000,
             max_open_positions: 1,
             daily_loss_limit_pct: 3.0,
             max_consecutive_losses: 5,
@@ -622,7 +652,7 @@ impl Default for StrategyConfig {
 /// 4. Time stop (exit if no profit after `time_stop_ms`)
 /// 5. Signal reversal (score crosses exit threshold)
 pub struct StrategyEngine {
-    config: StrategyConfig,
+    pub config: StrategyConfig,
     position: Position,
     trade_history: Vec<TradeRecord>,
     next_trade_id: u64,
@@ -768,13 +798,18 @@ impl StrategyEngine {
     /// Returns a value where positive = bullish, negative = bearish.
     pub fn compute_score(bar: &AggregatedBar) -> f64 {
         // Absorption direction logic:
-        // High absorption with contrary flow = reversal signal
-        let absorption_direction = if bar.absorption_score_max > 0.4 && bar.fk_net_direction_mean < 0.0
+        // High absorption with contrary flow AND order book confirmation = reversal signal
+        let absorption_direction = if bar.absorption_score_max > 0.4 
+            && bar.fk_net_direction_mean < 0.0 
+            && bar.ob_imbalance_mean > 0.1 
         {
-            // Buy absorption reversal: selling being absorbed = bullish
+            // Buy absorption reversal: selling being absorbed, and limit bids are stacked = bullish
             bar.absorption_score_max
-        } else if bar.absorption_score_max > 0.4 && bar.fk_net_direction_mean > 0.0 {
-            // Sell absorption reversal: buying being absorbed = bearish
+        } else if bar.absorption_score_max > 0.4 
+            && bar.fk_net_direction_mean > 0.0 
+            && bar.ob_imbalance_mean < -0.1 
+        {
+            // Sell absorption reversal: buying being absorbed, and limit asks are stacked = bearish
             -bar.absorption_score_max
         } else {
             0.0
@@ -808,8 +843,30 @@ impl StrategyEngine {
             }
         }
 
+        // 1. Spread Filter: Do not enter if the market is illiquid or volatile
+        if bar.avg_spread_bps > self.config.max_spread_bps {
+            return Signal::Hold;
+        }
+
         // Check long entry
         if score > self.config.long_entry_threshold {
+            // 2. Macro Trend Filter
+            if self.config.enforce_macro_trend && bar.cum_net_qty_final < 0.0 {
+                return Signal::Hold; // Do not long in a macro downtrend
+            }
+
+            // 3. Spoofing/Divergence Filter
+            if bar.ob_imbalance_trend < self.config.trend_divergence_threshold {
+                return Signal::Hold; // Bull trap: Aggressive buying but bids are being pulled
+            }
+
+            // 4. Liquidity Skew Filter (Path of least resistance)
+            // It should take MORE effort to push price down than to push it up
+            let skew_ratio = bar.avg_impact_sell_slippage_bps / (bar.avg_impact_buy_slippage_bps + 1e-9);
+            if skew_ratio < self.config.min_liquidity_skew_ratio {
+                return Signal::Hold;
+            }
+
             let has_absorption = bar.absorption_score_max >= self.config.min_absorption_for_reversal;
             let has_momentum = bar.fk_net_direction_mean > 0.1;
 
@@ -820,6 +877,23 @@ impl StrategyEngine {
 
         // Check short entry
         if score < self.config.short_entry_threshold {
+            // 2. Macro Trend Filter
+            if self.config.enforce_macro_trend && bar.cum_net_qty_final > 0.0 {
+                return Signal::Hold; // Do not short in a macro uptrend
+            }
+
+            // 3. Spoofing/Divergence Filter
+            if bar.ob_imbalance_trend > -self.config.trend_divergence_threshold {
+                return Signal::Hold; // Bear trap: Aggressive selling but asks are being pulled
+            }
+
+            // 4. Liquidity Skew Filter
+            // It should take MORE effort to push price up than to push it down
+            let skew_ratio = bar.avg_impact_buy_slippage_bps / (bar.avg_impact_sell_slippage_bps + 1e-9);
+            if skew_ratio < self.config.min_liquidity_skew_ratio {
+                return Signal::Hold;
+            }
+
             let has_absorption = bar.absorption_score_max >= self.config.min_absorption_for_reversal;
             let has_momentum = bar.fk_net_direction_mean < -0.1;
 
@@ -1031,7 +1105,7 @@ impl StrategyEngine {
     ///
     /// Returns `true` if the position was closed successfully.
     /// Returns `false` if the Binance order failed (position not closed).
-    fn close_position(&mut self, exit_price: f64, time_ms: u64, reason: &str) -> bool {
+    pub fn close_position(&mut self, exit_price: f64, time_ms: u64, reason: &str) -> bool {
         if self.position.is_flat() {
             return false;
         }
@@ -1187,6 +1261,7 @@ impl StrategyEngine {
     /// Computes the win rate from trade history.
     ///
     /// Returns 0.0 if there are no trades.
+    #[allow(dead_code)]
     pub fn win_rate(&self) -> f64 {
         if self.trade_history.is_empty() {
             return 0.0;
@@ -1199,6 +1274,7 @@ impl StrategyEngine {
     ///
     /// Returns `f64::INFINITY` if there are no losses.
     /// Returns 0.0 if there are no trades or no profits.
+    #[allow(dead_code)]
     pub fn profit_factor(&self) -> f64 {
         let gross_profit: f64 = self.trade_history.iter().filter(|t| t.pnl > 0.0).map(|t| t.pnl).sum();
         let gross_loss: f64 = self.trade_history.iter().filter(|t| t.pnl < 0.0).map(|t| t.pnl.abs()).sum();
@@ -1213,6 +1289,7 @@ impl StrategyEngine {
     }
 
     /// Computes the total realized P&L.
+    #[allow(dead_code)]
     pub fn total_pnl(&self) -> f64 {
         self.trade_history.iter().map(|t| t.pnl).sum()
     }
@@ -1221,6 +1298,7 @@ impl StrategyEngine {
     ///
     /// Tracks the equity curve through trades and finds the largest peak-to-trough
     /// decline as a percentage.
+    #[allow(dead_code)]
     pub fn max_drawdown_pct(&self) -> f64 {
         if self.trade_history.is_empty() {
             return 0.0;
@@ -1251,6 +1329,7 @@ impl StrategyEngine {
     ///
     /// Resets daily P&L and circuit breaker state while preserving
     /// trade history and current position.
+    #[allow(dead_code)]
     pub fn reset_daily(&mut self, current_equity: f64) {
         self.equity = current_equity;
         self.daily_start_equity = current_equity;
@@ -1263,6 +1342,7 @@ impl StrategyEngine {
     ///
     /// Clears trade history, closes any open position (without recording),
     /// and resets all counters.
+    #[allow(dead_code)]
     pub fn reset_all(&mut self, equity: f64) {
         self.position = Position::flat();
         self.trade_history.clear();
@@ -1285,6 +1365,7 @@ impl StrategyEngine {
 ///
 /// Appends completed trades to a CSV file with a header row on first write.
 /// Useful for post-analysis and record keeping.
+#[allow(dead_code)]
 pub struct TradeLogger {
     writer: Option<File>,
 }
@@ -1357,6 +1438,7 @@ impl TradeLogger {
 /// Contains win/loss statistics, P&L metrics, risk-adjusted returns,
 /// and streak analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct PerformanceReport {
     /// Total number of trades.
     pub total_trades: usize,
@@ -1601,6 +1683,9 @@ mod tests {
             ob_imbalance_max: 0.6,
             ob_imbalance_min: 0.4,
             ob_imbalance_trend: 0.01,
+            avg_spread_bps: 1.0,
+            cum_net_qty_final: 100.0,
+            cum_ratio_final: 1.0,
             fk_net_direction_mean: 0.5,
             fk_net_direction_max: 0.6,
             fk_net_direction_min: 0.4,
@@ -1617,7 +1702,7 @@ mod tests {
             absorption_score_mean: 0.5,
             absorption_score_final: 0.6,
             avg_impact_buy_slippage_bps: 0.5,
-            avg_impact_sell_slippage_bps: 0.5,
+            avg_impact_sell_slippage_bps: 1.0,
             total_trade_volume: 60000.0,
             avg_buy_volume_pct: 80.0,
             avg_trade_count_per_sec: 10.0,
@@ -1639,6 +1724,9 @@ mod tests {
             ob_imbalance_max: -0.4,
             ob_imbalance_min: -0.6,
             ob_imbalance_trend: -0.01,
+            avg_spread_bps: 1.0,
+            cum_net_qty_final: -100.0,
+            cum_ratio_final: 0.5,
             fk_net_direction_mean: -0.5,
             fk_net_direction_max: -0.4,
             fk_net_direction_min: -0.6,
@@ -1654,7 +1742,7 @@ mod tests {
             absorption_score_max: 0.71,
             absorption_score_mean: 0.5,
             absorption_score_final: 0.6,
-            avg_impact_buy_slippage_bps: 0.5,
+            avg_impact_buy_slippage_bps: 1.0,
             avg_impact_sell_slippage_bps: 0.5,
             total_trade_volume: 60000.0,
             avg_buy_volume_pct: 20.0,
@@ -1835,6 +1923,9 @@ mod tests {
             ob_imbalance_max: 0.0,
             ob_imbalance_min: 0.0,
             ob_imbalance_trend: 0.0,
+            avg_spread_bps: 0.0,
+            cum_net_qty_final: 0.0,
+            cum_ratio_final: 0.0,
             fk_net_direction_mean: 0.0,
             fk_net_direction_max: 0.0,
             fk_net_direction_min: 0.0,
@@ -1888,6 +1979,9 @@ mod tests {
             ob_imbalance_max: 0.6,
             ob_imbalance_min: 0.4,
             ob_imbalance_trend: 0.0,
+            avg_spread_bps: 1.0,
+            cum_net_qty_final: 100.0,
+            cum_ratio_final: 1.0,
             fk_net_direction_mean: 0.5,
             fk_net_direction_max: 0.6,
             fk_net_direction_min: 0.4,

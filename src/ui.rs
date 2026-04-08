@@ -533,7 +533,7 @@ impl OrderBookApp {
             last_interaction_time: Instant::now(),
             show_perf_overlay: true,
             perf_stats: PerfStats::new(),
-            strategy_enabled: true,
+            strategy_enabled: false,
             signal_extractor: Some(signal_extractor),
             signal_aggregator: SignalBarAggregator::new(30_000),
             strategy_engine,
@@ -3654,6 +3654,15 @@ impl OrderBookApp {
                 let enabled = &mut self.strategy_enabled;
                 if ui.selectable_label(*enabled, "⏻ LIVE").clicked() {
                     *enabled = !*enabled;
+                    // If toggled off, trigger emergency close
+                    if !*enabled && !self.strategy_engine.position().is_flat() {
+                        let current_price = state.mid_price;
+                        let time_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        self.strategy_engine.close_position(current_price, time_ms, "emergency_exit");
+                    }
                 }
                 ui.separator();
                 ui.label(
@@ -3668,6 +3677,38 @@ impl OrderBookApp {
                         .color(egui::Color32::from_rgb(150, 160, 180))
                         .size(12.0),
                 );
+                
+                ui.separator();
+                ui.label(egui::RichText::new("TF:").color(egui::Color32::GRAY).size(11.0));
+                
+                // Only allow timeframe change if position is flat
+                let is_flat = self.strategy_engine.position().is_flat();
+                ui.add_enabled_ui(is_flat, |ui| {
+                    let mut current_duration = self.strategy_engine.config.bar_duration_ms;
+                    
+                    let mut changed = false;
+                    egui::ComboBox::from_id_salt("strategy_tf_combo")
+                        .selected_text(match current_duration {
+                            15_000 => "15s",
+                            30_000 => "30s",
+                            60_000 => "1m",
+                            _ => "Custom",
+                        })
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_value(&mut current_duration, 15_000, "15s").clicked() { changed = true; }
+                            if ui.selectable_value(&mut current_duration, 30_000, "30s").clicked() { changed = true; }
+                            if ui.selectable_value(&mut current_duration, 60_000, "1m").clicked() { changed = true; }
+                        });
+                        
+                    if changed {
+                        self.strategy_engine.config.bar_duration_ms = current_duration;
+                        // Dynamically adjust the time_stop_ms based on the new timeframe
+                        // A good rule of thumb for this scalping strategy is exiting if no profit after 3-5 bars.
+                        self.strategy_engine.config.time_stop_ms = current_duration * 3;
+                        self.signal_aggregator = SignalBarAggregator::new(current_duration);
+                    }
+                });
             });
             
             ui.add_space(4.0);

@@ -588,6 +588,7 @@ impl SignalExtractor {
 /// Simple CSV logger for [`SignalSample`]s.
 ///
 /// Uses only `std::fs` / `std::io` — no external CSV crate required.
+#[allow(dead_code)]
 pub struct SignalLogger {
     writer: Option<File>,
 }
