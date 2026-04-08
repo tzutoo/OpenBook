@@ -927,13 +927,12 @@ impl eframe::App for OrderBookApp {
                         self.last_bar = Some(bar.clone());
                         let prev_trade_count = self.strategy_engine.trade_history().len();
                         self.last_signal = self.strategy_engine.on_bar(&bar);
-                        
-                        // Record new trades
-                        let trades = self.strategy_engine.trade_history();
-                        for _trade in &trades[prev_trade_count..] {
-                            // trades are logged internally by the engine
+
+                        // If a trade was executed, sync real trade history from Binance
+                        if self.strategy_engine.trade_history().len() != prev_trade_count {
+                            self.sync_binance_history();
                         }
-                        
+
                         // Update equity history
                         let equity = self.strategy_engine.equity();
                         self.equity_history.push((bar.bar_end_ms, equity));
@@ -3661,7 +3660,9 @@ impl OrderBookApp {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64;
-                        self.strategy_engine.close_position(current_price, time_ms, "emergency_exit");
+                        if self.strategy_engine.close_position(current_price, time_ms, "emergency_exit") {
+                            self.sync_binance_history();
+                        }
                     }
                 }
                 ui.separator();
