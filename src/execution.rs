@@ -741,6 +741,7 @@ impl BinanceTestnetClient {
         symbol: &str,
         side: &str,
         quantity: f64,
+        reduce_only: bool,
     ) -> Result<OrderResult, String> {
         // Enforce minimum quantity from MARKET_LOT_SIZE / LOT_SIZE filter
         if quantity < self.min_qty {
@@ -750,12 +751,16 @@ impl BinanceTestnetClient {
             ));
         }
 
-        let params = vec![
+        let mut params = vec![
             ("symbol".to_string(), symbol.to_string()),
             ("side".to_string(), side.to_uppercase()),
             ("type".to_string(), "MARKET".to_string()),
             ("quantity".to_string(), self.format_quantity(quantity)),
         ];
+
+        if reduce_only {
+            params.push(("reduceOnly".to_string(), "true".to_string()));
+        }
 
         let response = self.signed_post("/fapi/v1/order", params)?;
 

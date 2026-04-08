@@ -145,6 +145,12 @@ pub struct AggregatedBar {
     /// Absorption score from the final sample.
     pub absorption_score_final: f64,
 
+    // -- Liquidity Void --
+    /// Maximum levels moved by a single buy burst.
+    pub vd_buy_levels_max: u64,
+    /// Maximum levels moved by a single sell burst.
+    pub vd_sell_levels_max: u64,
+
     // -- Market impact --
     /// Average buy slippage in basis points.
     pub avg_impact_buy_slippage_bps: f64,
@@ -280,6 +286,10 @@ impl SignalBarAggregator {
         let absorption_score_mean = absorption_scores.iter().sum::<f64>() / sample_count as f64;
         let absorption_score_final = samples.last().unwrap().absorption_score;
 
+        // Liquidity Void stats
+        let vd_buy_levels_max = samples.iter().map(|s| s.vd_buy_levels).max().unwrap_or(0);
+        let vd_sell_levels_max = samples.iter().map(|s| s.vd_sell_levels).max().unwrap_or(0);
+
         // Market impact stats
         let avg_impact_buy_slippage_bps =
             samples.iter().map(|s| s.impact_buy_slippage_bps).sum::<f64>() / sample_count as f64;
@@ -324,6 +334,8 @@ impl SignalBarAggregator {
             absorption_score_max,
             absorption_score_mean,
             absorption_score_final,
+            vd_buy_levels_max,
+            vd_sell_levels_max,
             avg_impact_buy_slippage_bps,
             avg_impact_sell_slippage_bps,
             total_trade_volume,
@@ -550,6 +562,8 @@ pub struct StrategyConfig {
     pub trend_divergence_threshold: f64,
     /// Require cumulative session volume to align with trade direction (default: true).
     pub enforce_macro_trend: bool,
+    /// Minimum levels moved by a single burst to trigger a Liquidity Void Snap-back (default: 20).
+    pub min_void_levels_for_reversion: u64,
 
     // -- Signal weights (for composite score) --
     /// Weight for fill:kill net direction (default: 0.30).
@@ -604,6 +618,7 @@ impl Default for StrategyConfig {
             min_liquidity_skew_ratio: 1.2,
             trend_divergence_threshold: -0.05,
             enforce_macro_trend: true,
+            min_void_levels_for_reversion: 20,
             weight_fk_direction: 0.30,
             weight_aggression_shift: 0.25,
             weight_ob_imbalance: 0.15,
@@ -848,6 +863,18 @@ impl StrategyEngine {
             return Signal::Hold;
         }
 
+        // --- LIQUIDITY VOID SNAP-BACK (ANOMALY ENTRY) ---
+        // A void is created when aggressive flow rips through many levels in <1s.
+        // If sellers ripped through >= 20 levels of bids, the path up is vacuumed out -> Snap-back Long
+        if bar.vd_sell_levels_max >= self.config.min_void_levels_for_reversion {
+            return Signal::GoLong;
+        }
+        // If buyers ripped through >= 20 levels of asks, the path down is vacuumed out -> Snap-back Short
+        if bar.vd_buy_levels_max >= self.config.min_void_levels_for_reversion {
+            return Signal::GoShort;
+        }
+
+        // --- MOMENTUM / ABSORPTION (STANDARD ENTRY) ---
         // Check long entry
         if score > self.config.long_entry_threshold {
             // 2. Macro Trend Filter
@@ -1079,7 +1106,7 @@ impl StrategyEngine {
                 Side::Sell => "SELL",
             };
             let symbol = self.config.symbol.to_uppercase();
-            if client.place_market_order(&symbol, binance_side, quantity).is_err() {
+            if client.place_market_order(&symbol, binance_side, quantity, false).is_err() {
                 return false;
             }
         }
@@ -1120,7 +1147,7 @@ impl StrategyEngine {
                 PositionState::Flat => return false,
             };
             let symbol = self.config.symbol.to_uppercase();
-            if client.place_market_order(&symbol, binance_side, quantity).is_err() {
+            if client.place_market_order(&symbol, binance_side, quantity, true).is_err() {
                 return false;
             }
         }
@@ -1665,6 +1692,8 @@ mod tests {
             buy_volume_pct_1s: buy_volume_pct,
             absorption_score,
             aggression_shift,
+            vd_buy_levels: 0,
+            vd_sell_levels: 0,
         }
     }
 
@@ -1701,6 +1730,8 @@ mod tests {
             absorption_score_max: 0.71,
             absorption_score_mean: 0.5,
             absorption_score_final: 0.6,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
             avg_impact_buy_slippage_bps: 0.5,
             avg_impact_sell_slippage_bps: 1.0,
             total_trade_volume: 60000.0,
@@ -1742,6 +1773,8 @@ mod tests {
             absorption_score_max: 0.71,
             absorption_score_mean: 0.5,
             absorption_score_final: 0.6,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
             avg_impact_buy_slippage_bps: 1.0,
             avg_impact_sell_slippage_bps: 0.5,
             total_trade_volume: 60000.0,
@@ -1941,6 +1974,8 @@ mod tests {
             absorption_score_max: 0.0,
             absorption_score_mean: 0.0,
             absorption_score_final: 0.0,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
             avg_impact_buy_slippage_bps: 0.0,
             avg_impact_sell_slippage_bps: 0.0,
             total_trade_volume: 0.0,
@@ -1997,6 +2032,8 @@ mod tests {
             absorption_score_max: 0.5,
             absorption_score_mean: 0.4,
             absorption_score_final: 0.5,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
             avg_impact_buy_slippage_bps: 0.5,
             avg_impact_sell_slippage_bps: 0.5,
             total_trade_volume: 10000.0,
