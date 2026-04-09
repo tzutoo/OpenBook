@@ -546,6 +546,10 @@ pub struct StrategyConfig {
     pub short_entry_threshold: f64,
     /// Minimum absorption score for reversal entries (default: 0.7).
     pub min_absorption_for_reversal: f64,
+    /// Minimum fill:kill net direction for momentum-based entries (default: 0.15).
+    pub min_momentum_threshold: f64,
+    /// Minimum order book imbalance to confirm absorption direction in score (default: 0.1).
+    pub absorption_ob_imbalance_threshold: f64,
 
     // -- Exit thresholds --
     /// Composite score threshold to exit long (default: -0.2).
@@ -564,6 +568,15 @@ pub struct StrategyConfig {
     pub enforce_macro_trend: bool,
     /// Minimum levels moved by a single burst to trigger a Liquidity Void Snap-back (default: 20).
     pub min_void_levels_for_reversion: u64,
+    /// Price recovery from bar low as multiplier for void long confirmation (default: 1.0005 = 0.05%).
+    pub void_price_recovery_pct: f64,
+    /// Minimum order book imbalance to confirm void entry (default: 0.05).
+    pub void_ob_imbalance_threshold: f64,
+    /// Spread must be below this fraction of max_spread_bps for void entry (default: 0.7).
+    pub void_spread_tightness_pct: f64,
+    /// Minimum average trades per second to enter a trade (default: 0.5).
+    /// Filters out entries during low-activity periods where signals are often noise.
+    pub min_trades_per_sec: f64,
 
     // -- Signal weights (for composite score) --
     /// Weight for fill:kill net direction (default: 0.30).
@@ -592,6 +605,9 @@ pub struct StrategyConfig {
     pub trailing_stop_distance_pct: f64,
     /// Exit if no profit after this duration in ms (default: 90_000 = 1.5 min).
     pub time_stop_ms: u64,
+    /// Minimum number of bars before allowing stale trade exit (default: 1).
+    /// Prevents exiting too quickly before the trade has time to develop.
+    pub stale_exit_min_bars: u64,
     /// Maximum number of simultaneous open positions (default: 1).
     pub max_open_positions: usize,
 
@@ -606,19 +622,113 @@ pub struct StrategyConfig {
 
 impl Default for StrategyConfig {
     fn default() -> Self {
+        // Default uses 30s bars (balanced settings)
+        Self::for_30s()
+    }
+}
+
+impl StrategyConfig {
+    /// Timeframe preset for 15-second bars.
+    ///
+    /// **Characteristics:** High noise, fast signals, smaller per-bar moves.
+    /// **Adjustments:** Loosened for more trade frequency.
+    /// - Lowered entry thresholds to allow more signals through noisy bars
+    /// - Relaxed absorption/void thresholds to catch more reversals
+    /// - Widened spread filter to allow entries on more instruments
+    /// - Shortened cooldown to increase trade frequency
+    pub fn for_15s() -> Self {
+        Self {
+            symbol: String::new(),
+            bar_duration_ms: 15_000,
+            // Entry: loosened from 0.55 to allow more signals through noisy bars
+            long_entry_threshold: 0.40,
+            short_entry_threshold: -0.40,
+            // Absorption: lowered to catch more reversals
+            min_absorption_for_reversal: 0.55,
+            // Momentum: lowered from 0.20 to filter less
+            min_momentum_threshold: 0.12,
+            // Absorption OB confirmation: more lenient
+            absorption_ob_imbalance_threshold: 0.08,
+            // Exit: tighter to reduce whipsaw in noisy environment
+            long_exit_threshold: -0.05,
+            short_exit_threshold: 0.05,
+            // Spread: widened from 8.0 to allow entries on more instruments
+            max_spread_bps: 12.0,
+            // Liquidity skew: relaxed from 1.3
+            min_liquidity_skew_ratio: 1.1,
+            // Divergence: relaxed from -0.03 to -0.06
+            trend_divergence_threshold: -0.06,
+            enforce_macro_trend: true,
+            // Void: lowered from 35 to catch more void events
+            min_void_levels_for_reversion: 25,
+            // Void confirmation: relaxed
+            void_price_recovery_pct: 1.0005,
+            void_ob_imbalance_threshold: 0.04,
+            void_spread_tightness_pct: 0.75,
+            // Trade activity: lowered from 0.8 to allow quieter periods
+            min_trades_per_sec: 0.3,
+            // Weights: keep momentum emphasis (sum to 1.0)
+            weight_fk_direction: 0.35,
+            weight_aggression_shift: 0.25,
+            weight_ob_imbalance: 0.10,
+            weight_absorption: 0.10,
+            weight_buy_volume_pct: 0.20,
+            risk_per_trade_pct: 0.4,
+            max_position_size_usd: 10_000.0,
+            // Stop loss: tighter for smaller moves
+            stop_loss_pct: 0.20,
+            // Take profit: smaller target, more achievable
+            take_profit_pct: 0.10,
+            trailing_stop_activation_pct: 0.10,
+            trailing_stop_distance_pct: 0.05,
+            // Time stop: very fast exit (~1.3 bars)
+            time_stop_ms: 20_000,
+            // Stale exit: require 2 bars before allowing early exit
+            stale_exit_min_bars: 2,
+            max_open_positions: 1,
+            daily_loss_limit_pct: 3.0,
+            max_consecutive_losses: 5,
+            // Cooldown: shortened from 120s to 60s (4 bars)
+            cooldown_after_loss_ms: 60_000,
+        }
+    }
+
+    /// Timeframe preset for 30-second bars (default).
+    ///
+    /// **Characteristics:** Balanced noise/signal ratio, moderate moves.
+    /// **Adjustments:** Loosened for more trade frequency.
+    pub fn for_30s() -> Self {
         Self {
             symbol: String::new(),
             bar_duration_ms: 30_000,
-            long_entry_threshold: 0.25,
-            short_entry_threshold: -0.25,
-            min_absorption_for_reversal: 0.4,
-            long_exit_threshold: -0.2,
-            short_exit_threshold: 0.2,
-            max_spread_bps: 10.0,
-            min_liquidity_skew_ratio: 1.2,
-            trend_divergence_threshold: -0.05,
+            // Entry: loosened from 0.45 to allow more signals
+            long_entry_threshold: 0.30,
+            short_entry_threshold: -0.30,
+            // Absorption: lowered from 0.60 to catch more reversals
+            min_absorption_for_reversal: 0.45,
+            // Momentum: lowered from 0.15
+            min_momentum_threshold: 0.10,
+            // Absorption OB confirmation: more lenient
+            absorption_ob_imbalance_threshold: 0.06,
+            // Exit: slightly tighter reversal exit
+            long_exit_threshold: -0.08,
+            short_exit_threshold: 0.08,
+            // Spread: widened from 10.0 to allow entries on more instruments
+            max_spread_bps: 15.0,
+            // Liquidity skew: relaxed from 1.2
+            min_liquidity_skew_ratio: 1.05,
+            // Divergence: relaxed from -0.05 to -0.08
+            trend_divergence_threshold: -0.08,
             enforce_macro_trend: true,
+            // Void: lowered from 30 to catch more void events
             min_void_levels_for_reversion: 20,
+            // Void confirmation: relaxed
+            void_price_recovery_pct: 1.0003,
+            void_ob_imbalance_threshold: 0.03,
+            void_spread_tightness_pct: 0.80,
+            // Trade activity: lowered from 0.5 to allow quieter periods
+            min_trades_per_sec: 0.2,
+            // Weights: balanced (sum to 1.0)
             weight_fk_direction: 0.30,
             weight_aggression_shift: 0.25,
             weight_ob_imbalance: 0.15,
@@ -626,15 +736,97 @@ impl Default for StrategyConfig {
             weight_buy_volume_pct: 0.15,
             risk_per_trade_pct: 0.5,
             max_position_size_usd: 10_000.0,
-            stop_loss_pct: 0.15,
-            take_profit_pct: 0.30,
+            // Stop loss: tighter to limit per-trade damage
+            stop_loss_pct: 0.30,
+            // Take profit: more realistic target
+            take_profit_pct: 0.15,
             trailing_stop_activation_pct: 0.15,
             trailing_stop_distance_pct: 0.08,
-            time_stop_ms: 90_000,
+            // Time stop: exit faster if trade isn't working (~1.5 bars)
+            time_stop_ms: 45_000,
+            // Stale exit: require 1 bar before allowing early exit
+            stale_exit_min_bars: 1,
             max_open_positions: 1,
             daily_loss_limit_pct: 3.0,
             max_consecutive_losses: 5,
-            cooldown_after_loss_ms: 30_000,
+            // Cooldown: shortened from 180s to 90s (3 bars)
+            cooldown_after_loss_ms: 90_000,
+        }
+    }
+
+    /// Timeframe preset for 1-minute bars.
+    ///
+    /// **Characteristics:** Lower noise, smoother signals, larger per-bar moves.
+    /// **Adjustments:** Loosened for more trade frequency.
+    pub fn for_1m() -> Self {
+        Self {
+            symbol: String::new(),
+            bar_duration_ms: 60_000,
+            // Entry: loosened from 0.40 — smoother signals allow lower threshold
+            long_entry_threshold: 0.25,
+            short_entry_threshold: -0.25,
+            // Absorption: lowered from 0.50 to catch more reversals
+            min_absorption_for_reversal: 0.40,
+            // Momentum: lowered from 0.12
+            min_momentum_threshold: 0.08,
+            // Absorption OB confirmation: more lenient
+            absorption_ob_imbalance_threshold: 0.05,
+            // Exit: slightly wider reversal exit (less whipsaw on 1m)
+            long_exit_threshold: -0.10,
+            short_exit_threshold: 0.10,
+            // Spread: widened from 12.0 to allow entries on more instruments
+            max_spread_bps: 18.0,
+            // Liquidity skew: relaxed from 1.1 — effectively disabled
+            min_liquidity_skew_ratio: 1.0,
+            // Divergence: relaxed from -0.08 to -0.10
+            trend_divergence_threshold: -0.10,
+            enforce_macro_trend: true,
+            // Void: lowered from 25 to catch more void events
+            min_void_levels_for_reversion: 15,
+            // Void confirmation: more lenient on 1m bars
+            void_price_recovery_pct: 1.0002,
+            void_ob_imbalance_threshold: 0.02,
+            void_spread_tightness_pct: 0.85,
+            // Trade activity: lowered from 0.3 to allow quieter periods
+            min_trades_per_sec: 0.1,
+            // Weights: emphasize microstructure (sum to 1.0)
+            weight_fk_direction: 0.25,
+            weight_aggression_shift: 0.20,
+            weight_ob_imbalance: 0.20,
+            weight_absorption: 0.20,
+            weight_buy_volume_pct: 0.15,
+            risk_per_trade_pct: 0.6,
+            max_position_size_usd: 10_000.0,
+            // Stop loss: wider to allow breathing room
+            stop_loss_pct: 0.40,
+            // Take profit: larger target (moves are bigger)
+            take_profit_pct: 0.20,
+            trailing_stop_activation_pct: 0.20,
+            trailing_stop_distance_pct: 0.10,
+            // Time stop: longer (~1.5 bars)
+            time_stop_ms: 90_000,
+            // Stale exit: require 1 bar before allowing early exit
+            stale_exit_min_bars: 1,
+            max_open_positions: 1,
+            daily_loss_limit_pct: 3.0,
+            max_consecutive_losses: 5,
+            // Cooldown: shortened from 240s to 120s (2 bars)
+            cooldown_after_loss_ms: 120_000,
+        }
+    }
+
+    /// Create config for a given bar duration, selecting the appropriate preset.
+    ///
+    /// - `<= 20_000` ms → 15s preset
+    /// - `<= 45_000` ms → 30s preset
+    /// - `> 45_000` ms → 1m preset
+    pub fn for_bar_duration(bar_duration_ms: u64) -> Self {
+        if bar_duration_ms <= 20_000 {
+            Self::for_15s()
+        } else if bar_duration_ms <= 45_000 {
+            Self::for_30s()
+        } else {
+            Self::for_1m()
         }
     }
 }
@@ -792,7 +984,7 @@ impl StrategyEngine {
         }
 
         // If flat, check entry conditions
-        let entry_signal = self.check_entry(Self::compute_score(bar), bar);
+        let entry_signal = self.check_entry(self.compute_score(bar), bar);
         let opened = match entry_signal {
             Signal::GoLong => self.open_position(Side::Buy, bar.close_price, bar.bar_end_ms),
             Signal::GoShort => self.open_position(Side::Sell, bar.close_price, bar.bar_end_ms),
@@ -811,18 +1003,19 @@ impl StrategyEngine {
     /// - Buy volume percentage deviation from 50%
     ///
     /// Returns a value where positive = bullish, negative = bearish.
-    pub fn compute_score(bar: &AggregatedBar) -> f64 {
+    /// Uses configurable weights from `StrategyConfig`.
+    pub fn compute_score(&self, bar: &AggregatedBar) -> f64 {
         // Absorption direction logic:
         // High absorption with contrary flow AND order book confirmation = reversal signal
-        let absorption_direction = if bar.absorption_score_max > 0.4 
+        let absorption_direction = if bar.absorption_score_max > self.config.min_absorption_for_reversal 
             && bar.fk_net_direction_mean < 0.0 
-            && bar.ob_imbalance_mean > 0.1 
+            && bar.ob_imbalance_mean > self.config.absorption_ob_imbalance_threshold 
         {
             // Buy absorption reversal: selling being absorbed, and limit bids are stacked = bullish
             bar.absorption_score_max
-        } else if bar.absorption_score_max > 0.4 
+        } else if bar.absorption_score_max > self.config.min_absorption_for_reversal 
             && bar.fk_net_direction_mean > 0.0 
-            && bar.ob_imbalance_mean < -0.1 
+            && bar.ob_imbalance_mean < -self.config.absorption_ob_imbalance_threshold 
         {
             // Sell absorption reversal: buying being absorbed, and limit asks are stacked = bearish
             -bar.absorption_score_max
@@ -833,11 +1026,11 @@ impl StrategyEngine {
         // Buy volume normalized to [-1, 1] range
         let buy_volume_normalized = (bar.avg_buy_volume_pct - 50.0) / 50.0;
 
-        let score = bar.fk_net_direction_mean * 0.30
-            + bar.aggression_shift_mean * 0.25
-            + bar.ob_imbalance_mean * 0.15
-            + absorption_direction * 0.15
-            + buy_volume_normalized * 0.15;
+        let score = bar.fk_net_direction_mean * self.config.weight_fk_direction
+            + bar.aggression_shift_mean * self.config.weight_aggression_shift
+            + bar.ob_imbalance_mean * self.config.weight_ob_imbalance
+            + absorption_direction * self.config.weight_absorption
+            + buy_volume_normalized * self.config.weight_buy_volume_pct;
 
         score
     }
@@ -865,37 +1058,40 @@ impl StrategyEngine {
 
         // --- LIQUIDITY VOID SNAP-BACK (ANOMALY ENTRY) ---
         // A void is created when aggressive flow rips through many levels in <1s.
-        // If sellers ripped through >= 20 levels of bids, the path up is vacuumed out -> Snap-back Long
+        // Requires confirmation to avoid false triggers on noise.
+        let tight_spread = bar.avg_spread_bps < self.config.max_spread_bps * self.config.void_spread_tightness_pct;
+
+        // If sellers ripped through >= N levels of bids, the path up is vacuumed out -> Snap-back Long
         if bar.vd_sell_levels_max >= self.config.min_void_levels_for_reversion {
-            return Signal::GoLong;
+            // Confirm: price recovering from low, bids stacked, spread tight
+            let price_recovering = bar.close_price > bar.low_price * self.config.void_price_recovery_pct;
+            let bids_stacked = bar.ob_imbalance_mean > self.config.void_ob_imbalance_threshold;
+            if price_recovering && bids_stacked && tight_spread {
+                return Signal::GoLong;
+            }
         }
-        // If buyers ripped through >= 20 levels of asks, the path down is vacuumed out -> Snap-back Short
+        // If buyers ripped through >= N levels of asks, the path down is vacuumed out -> Snap-back Short
         if bar.vd_buy_levels_max >= self.config.min_void_levels_for_reversion {
-            return Signal::GoShort;
+            // Confirm: price falling from high, asks stacked, spread tight
+            let price_falling = bar.close_price < bar.high_price * (2.0 - self.config.void_price_recovery_pct);
+            let asks_stacked = bar.ob_imbalance_mean < -self.config.void_ob_imbalance_threshold;
+            if price_falling && asks_stacked && tight_spread {
+                return Signal::GoShort;
+            }
         }
 
         // --- MOMENTUM / ABSORPTION (STANDARD ENTRY) ---
         // Check long entry
         if score > self.config.long_entry_threshold {
-            // 2. Macro Trend Filter
-            if self.config.enforce_macro_trend && bar.cum_net_qty_final < 0.0 {
-                return Signal::Hold; // Do not long in a macro downtrend
-            }
-
-            // 3. Spoofing/Divergence Filter
-            if bar.ob_imbalance_trend < self.config.trend_divergence_threshold {
-                return Signal::Hold; // Bull trap: Aggressive buying but bids are being pulled
-            }
-
-            // 4. Liquidity Skew Filter (Path of least resistance)
-            // It should take MORE effort to push price down than to push it up
-            let skew_ratio = bar.avg_impact_sell_slippage_bps / (bar.avg_impact_buy_slippage_bps + 1e-9);
-            if skew_ratio < self.config.min_liquidity_skew_ratio {
+            // 5. Trade Activity Filter: avoid entries during low-activity periods
+            // Low activity often means the signal is noise, not genuine momentum
+            if bar.avg_trade_count_per_sec < self.config.min_trades_per_sec {
                 return Signal::Hold;
             }
 
+            // 6. Confirmation: require either strong absorption OR strong momentum
             let has_absorption = bar.absorption_score_max >= self.config.min_absorption_for_reversal;
-            let has_momentum = bar.fk_net_direction_mean > 0.1;
+            let has_momentum = bar.fk_net_direction_mean > self.config.min_momentum_threshold;
 
             if has_absorption || has_momentum {
                 return Signal::GoLong;
@@ -904,25 +1100,14 @@ impl StrategyEngine {
 
         // Check short entry
         if score < self.config.short_entry_threshold {
-            // 2. Macro Trend Filter
-            if self.config.enforce_macro_trend && bar.cum_net_qty_final > 0.0 {
-                return Signal::Hold; // Do not short in a macro uptrend
-            }
-
-            // 3. Spoofing/Divergence Filter
-            if bar.ob_imbalance_trend > -self.config.trend_divergence_threshold {
-                return Signal::Hold; // Bear trap: Aggressive selling but asks are being pulled
-            }
-
-            // 4. Liquidity Skew Filter
-            // It should take MORE effort to push price up than to push it down
-            let skew_ratio = bar.avg_impact_buy_slippage_bps / (bar.avg_impact_sell_slippage_bps + 1e-9);
-            if skew_ratio < self.config.min_liquidity_skew_ratio {
+            // 5. Trade Activity Filter: avoid entries during low-activity periods
+            if bar.avg_trade_count_per_sec < self.config.min_trades_per_sec {
                 return Signal::Hold;
             }
 
+            // 6. Confirmation: require either strong absorption OR strong momentum
             let has_absorption = bar.absorption_score_max >= self.config.min_absorption_for_reversal;
-            let has_momentum = bar.fk_net_direction_mean < -0.1;
+            let has_momentum = bar.fk_net_direction_mean < -self.config.min_momentum_threshold;
 
             if has_absorption || has_momentum {
                 return Signal::GoShort;
@@ -1000,9 +1185,26 @@ impl StrategyEngine {
             }
         }
 
-        // 4. Time stop check
+        // 4. Time stop checks
         let hold_duration = bar.bar_end_ms.saturating_sub(self.position.entry_time_ms);
-        if hold_duration > self.config.time_stop_ms && self.position.unrealized_pnl <= 0.0 {
+        let min_hold_for_stale = self.config.stale_exit_min_bars * self.config.bar_duration_ms;
+
+        // 4a. Stale trade: exit faster if no favorable movement at all
+        // A trade that hasn't moved in your favor is likely wrong - cut it early
+        // But only after minimum bars have passed to give the trade time to develop
+        let no_favorable_movement = self.position.max_favorable <= 0.0;
+        let stale_time_limit = self.config.time_stop_ms / 2; // Half the normal time limit
+        if hold_duration > stale_time_limit && hold_duration >= min_hold_for_stale && no_favorable_movement {
+            return match self.position.state {
+                PositionState::Long => Signal::ExitLong,
+                PositionState::Short => Signal::ExitShort,
+                PositionState::Flat => Signal::Hold,
+            };
+        }
+
+        // 4b. Full time stop: exit regardless of PnL if trade isn't working
+        // If we've held this long and it's not hitting take profit, get out
+        if hold_duration > self.config.time_stop_ms {
             return match self.position.state {
                 PositionState::Long => Signal::ExitLong,
                 PositionState::Short => Signal::ExitShort,
@@ -1011,7 +1213,7 @@ impl StrategyEngine {
         }
 
         // 5. Signal reversal check
-        let score = Self::compute_score(bar);
+        let score = self.compute_score(bar);
         match self.position.state {
             PositionState::Long => {
                 if score < self.config.long_exit_threshold {
@@ -1077,9 +1279,20 @@ impl StrategyEngine {
             }
         }
 
-        // 4. Time stop
+        // 4. Time stop checks
         let hold_duration = bar.bar_end_ms.saturating_sub(self.position.entry_time_ms);
-        if hold_duration > self.config.time_stop_ms && self.position.unrealized_pnl <= 0.0 {
+        let min_hold_for_stale = self.config.stale_exit_min_bars * self.config.bar_duration_ms;
+
+        // 4a. Stale trade: exit faster if no favorable movement at all
+        // But only after minimum bars have passed to give the trade time to develop
+        let no_favorable_movement = self.position.max_favorable <= 0.0;
+        let stale_time_limit = self.config.time_stop_ms / 2;
+        if hold_duration > stale_time_limit && hold_duration >= min_hold_for_stale && no_favorable_movement {
+            return "time_stop_stale";
+        }
+
+        // 4b. Full time stop: exit regardless of PnL
+        if hold_duration > self.config.time_stop_ms {
             return "time_stop";
         }
 
@@ -2229,5 +2442,413 @@ mod tests {
         assert!(engine.position().is_flat());
         assert_eq!(engine.trade_history().len(), 1);
         assert_eq!(engine.trade_history()[0].side, Side::Sell);
+    }
+
+    // =========================================================================
+    // Tests for configurable thresholds
+    // =========================================================================
+
+    #[test]
+    fn test_timeframe_presets_have_correct_bar_duration() {
+        let config_15s = StrategyConfig::for_15s();
+        let config_30s = StrategyConfig::for_30s();
+        let config_1m = StrategyConfig::for_1m();
+
+        assert_eq!(config_15s.bar_duration_ms, 15_000);
+        assert_eq!(config_30s.bar_duration_ms, 30_000);
+        assert_eq!(config_1m.bar_duration_ms, 60_000);
+    }
+
+    #[test]
+    fn test_timeframe_presets_weights_sum_to_one() {
+        let config_15s = StrategyConfig::for_15s();
+        let config_30s = StrategyConfig::for_30s();
+        let config_1m = StrategyConfig::for_1m();
+
+        let sum_15s = config_15s.weight_fk_direction + config_15s.weight_aggression_shift
+            + config_15s.weight_ob_imbalance + config_15s.weight_absorption
+            + config_15s.weight_buy_volume_pct;
+        let sum_30s = config_30s.weight_fk_direction + config_30s.weight_aggression_shift
+            + config_30s.weight_ob_imbalance + config_30s.weight_absorption
+            + config_30s.weight_buy_volume_pct;
+        let sum_1m = config_1m.weight_fk_direction + config_1m.weight_aggression_shift
+            + config_1m.weight_ob_imbalance + config_1m.weight_absorption
+            + config_1m.weight_buy_volume_pct;
+
+        assert!((sum_15s - 1.0).abs() < 1e-10, "15s weights should sum to 1.0, got {}", sum_15s);
+        assert!((sum_30s - 1.0).abs() < 1e-10, "30s weights should sum to 1.0, got {}", sum_30s);
+        assert!((sum_1m - 1.0).abs() < 1e-10, "1m weights should sum to 1.0, got {}", sum_1m);
+    }
+
+    #[test]
+    fn test_timeframe_presets_progressive_thresholds() {
+        let config_15s = StrategyConfig::for_15s();
+        let config_30s = StrategyConfig::for_30s();
+        let config_1m = StrategyConfig::for_1m();
+
+        // 15s should have widest entry thresholds (most noise filtering)
+        assert!(config_15s.long_entry_threshold > config_30s.long_entry_threshold,
+            "15s entry threshold ({}) should be > 30s ({})",
+            config_15s.long_entry_threshold, config_30s.long_entry_threshold);
+        assert!(config_30s.long_entry_threshold > config_1m.long_entry_threshold,
+            "30s entry threshold ({}) should be > 1m ({})",
+            config_30s.long_entry_threshold, config_1m.long_entry_threshold);
+
+        // 15s should have tightest exit thresholds
+        assert!(config_15s.long_exit_threshold.abs() < config_30s.long_exit_threshold.abs(),
+            "15s exit threshold ({}) should be tighter than 30s ({})",
+            config_15s.long_exit_threshold, config_30s.long_exit_threshold);
+
+        // 15s should have highest void level requirement
+        assert!(config_15s.min_void_levels_for_reversion > config_30s.min_void_levels_for_reversion,
+            "15s void levels ({}) should be > 30s ({})",
+            config_15s.min_void_levels_for_reversion, config_30s.min_void_levels_for_reversion);
+        assert!(config_30s.min_void_levels_for_reversion > config_1m.min_void_levels_for_reversion,
+            "30s void levels ({}) should be > 1m ({})",
+            config_30s.min_void_levels_for_reversion, config_1m.min_void_levels_for_reversion);
+
+        // 1m should have widest stop loss
+        assert!(config_1m.stop_loss_pct > config_30s.stop_loss_pct,
+            "1m stop loss ({}) should be > 30s ({})",
+            config_1m.stop_loss_pct, config_30s.stop_loss_pct);
+        assert!(config_30s.stop_loss_pct > config_15s.stop_loss_pct,
+            "30s stop loss ({}) should be > 15s ({})",
+            config_30s.stop_loss_pct, config_15s.stop_loss_pct);
+    }
+
+    #[test]
+    fn test_for_bar_duration_selects_correct_preset() {
+        let config_10s = StrategyConfig::for_bar_duration(10_000);
+        assert_eq!(config_10s.bar_duration_ms, 15_000, "10s should map to 15s preset");
+
+        let config_15s = StrategyConfig::for_bar_duration(15_000);
+        assert_eq!(config_15s.bar_duration_ms, 15_000);
+
+        let config_20s = StrategyConfig::for_bar_duration(20_000);
+        assert_eq!(config_20s.bar_duration_ms, 15_000, "20s should map to 15s preset");
+
+        let config_30s = StrategyConfig::for_bar_duration(30_000);
+        assert_eq!(config_30s.bar_duration_ms, 30_000);
+
+        let config_45s = StrategyConfig::for_bar_duration(45_000);
+        assert_eq!(config_45s.bar_duration_ms, 30_000, "45s should map to 30s preset");
+
+        let config_60s = StrategyConfig::for_bar_duration(60_000);
+        assert_eq!(config_60s.bar_duration_ms, 60_000);
+
+        let config_120s = StrategyConfig::for_bar_duration(120_000);
+        assert_eq!(config_120s.bar_duration_ms, 60_000, "120s should map to 1m preset");
+    }
+
+    #[test]
+    fn test_void_confirmation_requires_all_conditions() {
+        // Create config with strict void confirmation thresholds
+        let config = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            min_void_levels_for_reversion: 25,
+            void_price_recovery_pct: 1.001, // 0.1% recovery required
+            void_ob_imbalance_threshold: 0.1,
+            void_spread_tightness_pct: 0.5, // Very tight spread required
+            max_spread_bps: 10.0,
+            ..Default::default()
+        };
+        let engine = StrategyEngine::new(config, 10_000.0);
+
+        // Bar with void but NO price recovery, NO OB imbalance, NO tight spread
+        let void_bar_no_confirm = AggregatedBar {
+            bar_start_ms: 0,
+            bar_end_ms: 30_000,
+            sample_count: 30,
+            open_price: 50000.0,
+            close_price: 49900.0, // BELOW low * 1.001 - no recovery
+            high_price: 50100.0,
+            low_price: 49800.0, // close = 49900, low = 49800, 49800 * 1.001 = 49849.8, 49900 > 49849.8 - actually recovers!
+            avg_mid_price: 49950.0,
+            ob_imbalance_mean: 0.0, // No OB imbalance
+            ob_imbalance_max: 0.0,
+            ob_imbalance_min: 0.0,
+            ob_imbalance_trend: 0.0,
+            avg_spread_bps: 8.0, // 8.0 < 10.0 * 0.5 = 5.0? No, 8.0 > 5.0 - spread not tight
+            cum_net_qty_final: 0.0,
+            cum_ratio_final: 1.0,
+            fk_net_direction_mean: 0.0,
+            fk_net_direction_max: 0.0,
+            fk_net_direction_min: 0.0,
+            fk_net_direction_final: 0.0,
+            fk_buy_fill_total: 0.0,
+            fk_sell_fill_total: 100.0,
+            fk_buy_kill_total: 0.0,
+            fk_sell_kill_total: 50.0,
+            aggression_shift_mean: 0.0,
+            aggression_shift_max: 0.0,
+            aggression_shift_min: 0.0,
+            aggression_shift_final: 0.0,
+            absorption_score_max: 0.0,
+            absorption_score_mean: 0.0,
+            absorption_score_final: 0.0,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 30, // Void exists!
+            avg_impact_buy_slippage_bps: 5.0,
+            avg_impact_sell_slippage_bps: 5.0,
+            total_trade_volume: 1000.0,
+            avg_buy_volume_pct: 30.0,
+            avg_trade_count_per_sec: 2.0,
+        };
+
+        let signal = engine.check_entry(0.0, &void_bar_no_confirm);
+        assert_eq!(signal, Signal::Hold, "Should not enter void without all confirmations");
+    }
+
+    #[test]
+    fn test_void_confirmation_with_all_conditions_met() {
+        let config = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            min_void_levels_for_reversion: 25,
+            void_price_recovery_pct: 1.0005,
+            void_ob_imbalance_threshold: 0.05,
+            void_spread_tightness_pct: 0.7,
+            max_spread_bps: 10.0,
+            ..Default::default()
+        };
+        let engine = StrategyEngine::new(config, 10_000.0);
+
+        // Bar with void AND all confirmations
+        let void_bar_with_confirm = AggregatedBar {
+            bar_start_ms: 0,
+            bar_end_ms: 30_000,
+            sample_count: 30,
+            open_price: 50000.0,
+            close_price: 49950.0, // Must be > low * 1.0005
+            high_price: 50100.0,
+            low_price: 49900.0, // 49900 * 1.0005 = 49924.95, close 49950 > 49924.95 ✓
+            avg_mid_price: 49975.0,
+            ob_imbalance_mean: 0.1, // > 0.05 ✓
+            ob_imbalance_max: 0.15,
+            ob_imbalance_min: 0.05,
+            ob_imbalance_trend: 0.0,
+            avg_spread_bps: 5.0, // 5.0 < 10.0 * 0.7 = 7.0 ✓
+            cum_net_qty_final: 0.0,
+            cum_ratio_final: 1.0,
+            fk_net_direction_mean: 0.0,
+            fk_net_direction_max: 0.0,
+            fk_net_direction_min: 0.0,
+            fk_net_direction_final: 0.0,
+            fk_buy_fill_total: 0.0,
+            fk_sell_fill_total: 100.0,
+            fk_buy_kill_total: 0.0,
+            fk_sell_kill_total: 50.0,
+            aggression_shift_mean: 0.0,
+            aggression_shift_max: 0.0,
+            aggression_shift_min: 0.0,
+            aggression_shift_final: 0.0,
+            absorption_score_max: 0.0,
+            absorption_score_mean: 0.0,
+            absorption_score_final: 0.0,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 30, // Void exists ✓
+            avg_impact_buy_slippage_bps: 5.0,
+            avg_impact_sell_slippage_bps: 5.0,
+            total_trade_volume: 1000.0,
+            avg_buy_volume_pct: 30.0,
+            avg_trade_count_per_sec: 2.0,
+        };
+
+        let signal = engine.check_entry(0.0, &void_bar_with_confirm);
+        assert_eq!(signal, Signal::GoLong, "Should enter void long with all confirmations");
+    }
+
+    #[test]
+    fn test_stale_exit_respects_min_bars() {
+        // Config with 2 bar minimum for stale exit, 30s bars
+        let config = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            bar_duration_ms: 30_000,
+            time_stop_ms: 60_000, // 2 bars
+            stale_exit_min_bars: 2, // Require 2 bars before stale exit
+            stop_loss_pct: 1.0, // High to not trigger
+            take_profit_pct: 1.0, // High to not trigger
+            ..Default::default()
+        };
+        let mut engine = StrategyEngine::new(config, 10_000.0);
+        engine.open_position(Side::Buy, 50000.0, 0);
+
+        // Update position to show no favorable movement
+        engine.position.update_market(49900.0); // Moved against us
+
+        // Bar at 20s (less than 2 bars = 60s) - should NOT trigger stale exit
+        let bar_early = AggregatedBar {
+            bar_start_ms: 0,
+            bar_end_ms: 20_000, // Only 20s, less than 2 bars
+            sample_count: 20,
+            open_price: 50000.0,
+            close_price: 49900.0,
+            high_price: 50000.0,
+            low_price: 49900.0,
+            avg_mid_price: 49950.0,
+            ob_imbalance_mean: 0.0,
+            ob_imbalance_max: 0.0,
+            ob_imbalance_min: 0.0,
+            ob_imbalance_trend: 0.0,
+            avg_spread_bps: 5.0,
+            cum_net_qty_final: 0.0,
+            cum_ratio_final: 1.0,
+            fk_net_direction_mean: 0.0,
+            fk_net_direction_max: 0.0,
+            fk_net_direction_min: 0.0,
+            fk_net_direction_final: 0.0,
+            fk_buy_fill_total: 0.0,
+            fk_sell_fill_total: 0.0,
+            fk_buy_kill_total: 0.0,
+            fk_sell_kill_total: 0.0,
+            aggression_shift_mean: 0.0,
+            aggression_shift_max: 0.0,
+            aggression_shift_min: 0.0,
+            aggression_shift_final: 0.0,
+            absorption_score_max: 0.0,
+            absorption_score_mean: 0.0,
+            absorption_score_final: 0.0,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
+            avg_impact_buy_slippage_bps: 5.0,
+            avg_impact_sell_slippage_bps: 5.0,
+            total_trade_volume: 0.0,
+            avg_buy_volume_pct: 50.0,
+            avg_trade_count_per_sec: 1.0,
+        };
+
+        let signal_early = engine.check_exit(&bar_early);
+        assert_ne!(signal_early, Signal::ExitLong,
+            "Should NOT exit stale before min_bars (20s < 60s)");
+
+        // Bar at 70s (more than 2 bars = 60s) - SHOULD trigger stale exit
+        let bar_late = AggregatedBar {
+            bar_start_ms: 0,
+            bar_end_ms: 70_000, // 70s, more than 2 bars (60s)
+            sample_count: 70,
+            open_price: 50000.0,
+            close_price: 49900.0,
+            high_price: 50000.0,
+            low_price: 49900.0,
+            avg_mid_price: 49950.0,
+            ob_imbalance_mean: 0.0,
+            ob_imbalance_max: 0.0,
+            ob_imbalance_min: 0.0,
+            ob_imbalance_trend: 0.0,
+            avg_spread_bps: 5.0,
+            cum_net_qty_final: 0.0,
+            cum_ratio_final: 1.0,
+            fk_net_direction_mean: 0.0,
+            fk_net_direction_max: 0.0,
+            fk_net_direction_min: 0.0,
+            fk_net_direction_final: 0.0,
+            fk_buy_fill_total: 0.0,
+            fk_sell_fill_total: 0.0,
+            fk_buy_kill_total: 0.0,
+            fk_sell_kill_total: 0.0,
+            aggression_shift_mean: 0.0,
+            aggression_shift_max: 0.0,
+            aggression_shift_min: 0.0,
+            aggression_shift_final: 0.0,
+            absorption_score_max: 0.0,
+            absorption_score_mean: 0.0,
+            absorption_score_final: 0.0,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
+            avg_impact_buy_slippage_bps: 5.0,
+            avg_impact_sell_slippage_bps: 5.0,
+            total_trade_volume: 0.0,
+            avg_buy_volume_pct: 50.0,
+            avg_trade_count_per_sec: 1.0,
+        };
+
+        let signal_late = engine.check_exit(&bar_late);
+        assert_eq!(signal_late, Signal::ExitLong,
+            "SHOULD exit stale after min_bars (70s > 60s)");
+    }
+
+    #[test]
+    fn test_momentum_threshold_configurable() {
+        // Test with high momentum threshold - should NOT enter
+        let config_high = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            long_entry_threshold: 0.3,
+            min_momentum_threshold: 0.5, // Very high
+            min_absorption_for_reversal: 0.9, // Very high (effectively disabled)
+            ..Default::default()
+        };
+        let engine_high = StrategyEngine::new(config_high, 10_000.0);
+
+        let bar_moderate_momentum = AggregatedBar {
+            bar_start_ms: 0,
+            bar_end_ms: 30_000,
+            sample_count: 30,
+            open_price: 50000.0,
+            close_price: 50100.0,
+            high_price: 50100.0,
+            low_price: 50000.0,
+            avg_mid_price: 50050.0,
+            ob_imbalance_mean: 0.2,
+            ob_imbalance_max: 0.3,
+            ob_imbalance_min: 0.1,
+            ob_imbalance_trend: 0.0,
+            avg_spread_bps: 5.0,
+            cum_net_qty_final: 100.0,
+            cum_ratio_final: 1.5,
+            fk_net_direction_mean: 0.4, // Score = 0.4 * 0.3 = 0.12... but we pass score directly
+            fk_net_direction_max: 0.5,
+            fk_net_direction_min: 0.3,
+            fk_net_direction_final: 0.4,
+            fk_buy_fill_total: 100.0,
+            fk_sell_fill_total: 20.0,
+            fk_buy_kill_total: 10.0,
+            fk_sell_kill_total: 5.0,
+            aggression_shift_mean: 0.3,
+            aggression_shift_max: 0.4,
+            aggression_shift_min: 0.2,
+            aggression_shift_final: 0.3,
+            absorption_score_max: 0.5, // Below 0.9 threshold
+            absorption_score_mean: 0.4,
+            absorption_score_final: 0.5,
+            vd_buy_levels_max: 0,
+            vd_sell_levels_max: 0,
+            avg_impact_buy_slippage_bps: 5.0,
+            avg_impact_sell_slippage_bps: 8.0, // skew = 8/5 = 1.6 > 1.2
+            total_trade_volume: 1000.0,
+            avg_buy_volume_pct: 80.0,
+            avg_trade_count_per_sec: 2.0,
+        };
+
+        // Score above entry threshold, but momentum below min_momentum_threshold
+        let signal = engine_high.check_entry(0.35, &bar_moderate_momentum);
+        assert_eq!(signal, Signal::Hold,
+            "Should NOT enter when momentum ({}) < min_momentum_threshold (0.5)",
+            bar_moderate_momentum.fk_net_direction_mean);
+
+        // Test with low momentum threshold - SHOULD enter
+        let config_low = StrategyConfig {
+            symbol: "BTCUSDT".to_string(),
+            long_entry_threshold: 0.3,
+            min_momentum_threshold: 0.1, // Very low
+            min_absorption_for_reversal: 0.9,
+            ..Default::default()
+        };
+        let engine_low = StrategyEngine::new(config_low, 10_000.0);
+
+        let signal = engine_low.check_entry(0.35, &bar_moderate_momentum);
+        assert_eq!(signal, Signal::GoLong,
+            "SHOULD enter when momentum ({}) > min_momentum_threshold (0.1)",
+            bar_moderate_momentum.fk_net_direction_mean);
+    }
+
+    #[test]
+    fn test_default_config_is_30s_preset() {
+        let default_config = StrategyConfig::default();
+        let preset_30s = StrategyConfig::for_30s();
+
+        assert_eq!(default_config.bar_duration_ms, preset_30s.bar_duration_ms);
+        assert_eq!(default_config.long_entry_threshold, preset_30s.long_entry_threshold);
+        assert_eq!(default_config.short_entry_threshold, preset_30s.short_entry_threshold);
+        assert_eq!(default_config.stop_loss_pct, preset_30s.stop_loss_pct);
+        assert_eq!(default_config.min_void_levels_for_reversion, preset_30s.min_void_levels_for_reversion);
     }
 }

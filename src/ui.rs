@@ -218,11 +218,30 @@ fn format_volume(vol: f64) -> String {
         format!("{:.1}B", vol / 1_000_000_000.0)
     } else if vol >= 1_000_000.0 {
         format!("{:.1}M", vol / 1_000_000.0)
-    } else if vol >= 1_000.0 {
+    } else if vol >= 10_000.0 {
         format!("{:.1}K", vol / 1_000.0)
+    } else if vol >= 1_000.0 {
+        format!("{:.2}K", vol / 1_000.0)
+    } else if vol >= 10.0 {
+        format!("{:.1}", vol)
+    } else if vol >= 1.0 {
+        format!("{:.2}", vol)
+    } else if vol == 0.0 {
+        "0.00".to_string()
     } else {
-        format!("{:.0}", vol)
+        format!("{:.4}", vol)
     }
+}
+
+/// Returns the timestamp in milliseconds for midnight UTC today.
+/// Used to filter trades for daily PnL calculation.
+fn today_midnight_ms_utc() -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const MS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
+    (now_ms / MS_PER_DAY) * MS_PER_DAY
 }
 
 fn build_tape_rows(
@@ -378,7 +397,7 @@ impl PaneRenderer for AppPaneRenderer<'_> {
             PaneKind::FillKill => self.app.render_fill_kill_pane_body(ui, self.state),
             PaneKind::TradesTape => self.app.render_trades_tape_pane_body(ui, self.state),
             PaneKind::Strategy => self.app.render_strategy_pane(ui, self.state),
-            PaneKind::TradeLog => self.app.render_trade_log_pane(ui),
+            PaneKind::TradeLog => self.app.render_trade_log_pane(ui, self.state),
             PaneKind::EquityCurve => self.app.render_equity_curve_pane(ui),
         }
     }
@@ -1050,31 +1069,33 @@ impl eframe::App for OrderBookApp {
 
                 ui.separator();
 
-                ui.label("Symbol:");
-                let sym_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.picker_query)
-                        .desired_width(120.0)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("Search symbols..."),
-                );
-                picker_input_rect = Some(sym_resp.rect);
-                symbol_has_focus = sym_resp.has_focus();
+                ui.add_enabled_ui(!self.strategy_enabled, |ui| {
+                    ui.label("Symbol:");
+                    let sym_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.picker_query)
+                            .desired_width(120.0)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("Search symbols..."),
+                    );
+                    picker_input_rect = Some(sym_resp.rect);
+                    symbol_has_focus = sym_resp.has_focus();
 
-                if sym_resp.gained_focus() || sym_resp.changed() {
-                    self.picker_open = true;
-                }
-                if sym_resp.gained_focus() {
-                    picker_force_recompute = true;
-                }
-                if sym_resp.changed() {
-                    self.picker_selected_idx = 0;
-                    picker_force_recompute = true;
-                }
+                    if sym_resp.gained_focus() || sym_resp.changed() {
+                        self.picker_open = true;
+                    }
+                    if sym_resp.gained_focus() {
+                        picker_force_recompute = true;
+                    }
+                    if sym_resp.changed() {
+                        self.picker_selected_idx = 0;
+                        picker_force_recompute = true;
+                    }
 
-                if ui.button("▶ Connect").clicked() {
-                    trigger_reconnect = true;
-                    self.picker_open = false;
-                }
+                    if ui.button("▶ Connect").clicked() {
+                        trigger_reconnect = true;
+                        self.picker_open = false;
+                    }
+                });
 
                 ui.separator();
 
@@ -3682,9 +3703,8 @@ impl OrderBookApp {
                 ui.separator();
                 ui.label(egui::RichText::new("TF:").color(egui::Color32::GRAY).size(11.0));
                 
-                // Only allow timeframe change if position is flat
-                let is_flat = self.strategy_engine.position().is_flat();
-                ui.add_enabled_ui(is_flat, |ui| {
+                // Only allow timeframe change if live trading is stopped
+                ui.add_enabled_ui(!self.strategy_enabled, |ui| {
                     let mut current_duration = self.strategy_engine.config.bar_duration_ms;
                     
                     let mut changed = false;
@@ -3703,11 +3723,15 @@ impl OrderBookApp {
                         });
                         
                     if changed {
-                        self.strategy_engine.config.bar_duration_ms = current_duration;
-                        // Dynamically adjust the time_stop_ms based on the new timeframe
-                        // A good rule of thumb for this scalping strategy is exiting if no profit after 3-5 bars.
-                        self.strategy_engine.config.time_stop_ms = current_duration * 3;
+                        // Apply timeframe-specific preset (preserves symbol and other runtime settings)
+                        let preset = crate::strategy::StrategyConfig::for_bar_duration(current_duration);
+                        let symbol = self.strategy_engine.config.symbol.clone();
+                        self.strategy_engine.config = preset;
+                        self.strategy_engine.config.symbol = symbol;
                         self.signal_aggregator = SignalBarAggregator::new(current_duration);
+                        self.last_bar = None;
+                        self.last_signal = crate::strategy::Signal::Hold;
+                        self.last_instant_score = 0.0;
                     }
                 });
             });
@@ -3716,20 +3740,26 @@ impl OrderBookApp {
             ui.separator();
             ui.add_space(4.0);
             
-            // Composite score (30s bar — drives decisions)
+            // Composite score (bar — drives decisions)
             let score = self.last_bar.as_ref()
-                .map(|b| StrategyEngine::compute_score(b))
+                .map(|b| self.strategy_engine.compute_score(b))
                 .unwrap_or(0.0);
             let score_color = if score > 0.1 {
                 BID_COLOR
             } else if score < -0.1 {
-                ASK_COLOR
+                egui::Color32::GRAY
             } else {
                 egui::Color32::GRAY
             };
+            let tf_label = match self.strategy_engine.config.bar_duration_ms {
+                15_000 => "15s".to_string(),
+                30_000 => "30s".to_string(),
+                60_000 => "1m".to_string(),
+                ms => format!("{}ms", ms),
+            };
             
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("SCORE (30s)").color(egui::Color32::GRAY).size(11.0));
+                ui.label(egui::RichText::new(format!("SCORE ({})", tf_label)).color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(format!("{score:+.3}")).color(score_color).strong().size(16.0));
                 });
@@ -3834,10 +3864,18 @@ impl OrderBookApp {
             ui.separator();
             ui.add_space(4.0);
             
-            // Account summary
-            let equity = self.strategy_engine.equity();
-            let daily_pnl = self.strategy_engine.daily_pnl();
-            let equity_color = if equity >= self.initial_equity { BID_COLOR } else { ASK_COLOR };
+            // Account summary - calculate daily PnL from round_trips that closed today
+            let today_midnight = today_midnight_ms_utc();
+            let daily_pnl: f64 = self.round_trips
+                .iter()
+                .filter(|t| t.exit_time_ms >= today_midnight)
+                .map(|t| t.net_pnl)
+                .sum();
+            
+            // Current equity is the balance from Binance, initial at day start is equity minus today's PnL
+            let equity = self.initial_equity;
+            let day_start_equity = equity - daily_pnl;
+            let equity_color = if equity >= day_start_equity { BID_COLOR } else { ASK_COLOR };
             
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("EQUITY").color(egui::Color32::GRAY).size(11.0));
@@ -3850,7 +3888,7 @@ impl OrderBookApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("INITIAL").color(egui::Color32::GRAY).size(11.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{:.2}", self.initial_equity))
+                    ui.label(egui::RichText::new(format!("{:.2}", day_start_equity))
                         .color(egui::Color32::GRAY).size(12.0));
                 });
             });
@@ -3864,8 +3902,8 @@ impl OrderBookApp {
                 });
             });
             
-            let daily_pct = if self.initial_equity > 0.0 {
-                (daily_pnl / self.initial_equity) * 100.0
+            let daily_pct = if day_start_equity > 0.0 {
+                (daily_pnl / day_start_equity) * 100.0
             } else {
                 0.0
             };
@@ -4010,48 +4048,98 @@ impl OrderBookApp {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("ENTRY PROXIMITY").color(egui::Color32::GRAY).small());
+                ui.label(egui::RichText::new("ENTRY GATES").color(egui::Color32::GRAY).small());
 
-                let long_gap = (0.25 - score).max(0.0);
-                let short_gap = (score - (-0.25)).max(0.0);
-                let score_gap = if score >= 0.0 { long_gap } else { short_gap };
-                let gap_color = if score_gap <= 0.0 { BID_COLOR } else if score_gap < 0.1 { AMBER_COLOR } else { ASK_COLOR };
-                label_row(ui, "Score Gap", &format!("{:.3}", score_gap), gap_color);
+                if self.strategy_enabled {
+                    // Gate checklist — mirrors check_entry() logic exactly
+                    let cfg = &self.strategy_engine.config;
+                    let is_long = score >= 0.0;
 
-                let fk_abs = bar.fk_net_direction_mean.abs();
-                let momentum_met = fk_abs >= 0.1;
-                let momentum_color = if momentum_met { BID_COLOR } else { egui::Color32::from_rgb(100, 80, 40) };
-                label_row(ui, "Momentum", &format!(
-                    "{}{}",
-                    if momentum_met { "✓ " } else { "  " },
-                    format!("{:.3}/0.1", fk_abs)
-                ), momentum_color);
+                    // Compute each gate (in check_entry evaluation order)
+                    let spread_ok = bar.avg_spread_bps <= cfg.max_spread_bps;
+                    let score_ok = if is_long {
+                        score > cfg.long_entry_threshold
+                    } else {
+                        score < cfg.short_entry_threshold
+                    };
+                    let activity_ok = bar.avg_trade_count_per_sec >= cfg.min_trades_per_sec;
+                    let mom_ok = if is_long {
+                        bar.fk_net_direction_mean > cfg.min_momentum_threshold
+                    } else {
+                        bar.fk_net_direction_mean < -cfg.min_momentum_threshold
+                    };
+                    let abs_ok = bar.absorption_score_max >= cfg.min_absorption_for_reversal;
+                    let confirm_ok = abs_ok || mom_ok;
 
-                let abs_val = bar.absorption_score_max;
-                let reversal_met = abs_val >= 0.4;
-                let reversal_color = if reversal_met { BID_COLOR } else { egui::Color32::from_rgb(100, 80, 40) };
-                label_row(ui, "Reversal", &format!(
-                    "{}{}",
-                    if reversal_met { "✓ " } else { "  " },
-                    format!("{:.3}/0.4", abs_val)
-                ), reversal_color);
+                    // Find first blocker (gates are sequential — first fail stops evaluation)
+                    let gate_results: &[(&str, bool)] = &[
+                        ("SPREAD", spread_ok),
+                        ("SCORE", score_ok),
+                        ("ACTIVITY", activity_ok),
+                        ("CONFIRM", confirm_ok),
+                    ];
+                    let blocker = gate_results.iter().find(|(_, ok)| !*ok).map(|(name, _)| *name);
+                    let all_ok = blocker.is_none();
 
-                let any_confirm = momentum_met || reversal_met;
-                let ready = score_gap <= 0.0 && any_confirm;
-                let ready_color = if ready { BID_COLOR } else { egui::Color32::from_rgb(60, 65, 75) };
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("READY").color(egui::Color32::from_rgb(90, 95, 105)).size(11.0));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ready_text = if ready { "[GO]" } else { "[--]" };
-                        ui.label(egui::RichText::new(ready_text).color(ready_color).strong().size(12.0));
+                    // Helper: color for gate row
+                    let gc = |passed: bool, is_blocker: bool| -> egui::Color32 {
+                        if passed { BID_COLOR }
+                        else if is_blocker { ASK_COLOR }
+                        else { egui::Color32::from_rgb(80, 75, 65) }
+                    };
+
+                    // Display each gate with actual config thresholds
+                    let side = if is_long { "L" } else { "S" };
+                    let thr = if is_long { cfg.long_entry_threshold } else { cfg.short_entry_threshold };
+                    label_row(ui, &format!("{} Score", side),
+                        &format!("{:+.3} > {:+.3}", score, thr),
+                        gc(score_ok, blocker == Some("SCORE")));
+
+                    label_row(ui, "Spread",
+                        &format!("{:.1}/{:.1} bps", bar.avg_spread_bps, cfg.max_spread_bps),
+                        gc(spread_ok, blocker == Some("SPREAD")));
+
+                    label_row(ui, "Activity",
+                        &format!("{:.1}/{:.1} t/s", bar.avg_trade_count_per_sec, cfg.min_trades_per_sec),
+                        gc(activity_ok, blocker == Some("ACTIVITY")));
+
+                    // Confirmation sub-gates (informational — not sequential blockers)
+                    let mom_abs = bar.fk_net_direction_mean.abs();
+                    label_row(ui, "  Momentum",
+                        &format!("{:.3}/{:.3}", mom_abs, cfg.min_momentum_threshold),
+                        if mom_ok { BID_COLOR } else { egui::Color32::from_rgb(80, 75, 65) });
+
+                    label_row(ui, "  Absorption",
+                        &format!("{:.3}/{:.3}", bar.absorption_score_max, cfg.min_absorption_for_reversal),
+                        if abs_ok { BID_COLOR } else { egui::Color32::from_rgb(80, 75, 65) });
+
+                    label_row(ui, "Confirm",
+                        if confirm_ok { "✓ met" } else { "✗ none" },
+                        gc(confirm_ok, blocker == Some("CONFIRM")));
+
+                    // Final READY indicator — shows [GO] or [BLOCKER] or [--]
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("READY").color(egui::Color32::from_rgb(90, 95, 105)).size(11.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (ready_text, ready_color) = if all_ok {
+                                (format!("[GO]"), BID_COLOR)
+                            } else if let Some(b) = blocker {
+                                (format!("[{}]", b), ASK_COLOR)
+                            } else {
+                                (format!("[--]"), egui::Color32::from_rgb(60, 65, 75))
+                            };
+                            ui.label(egui::RichText::new(ready_text).color(ready_color).strong().size(12.0));
+                        });
                     });
-                });
+                } else {
+                    ui.label(egui::RichText::new("Start live trading to view gates").color(egui::Color32::from_rgb(80, 85, 95)).small());
+                }
             }
         });
     }
 
-    fn render_trade_log_pane(&mut self, ui: &mut egui::Ui) {
+    fn render_trade_log_pane(&mut self, ui: &mut egui::Ui, state: &StateSnapshot) {
         let trades = &self.binance_trades;
 
         egui::ScrollArea::vertical()
@@ -4098,10 +4186,10 @@ impl OrderBookApp {
                             egui::RichText::new(&trade.side).color(side_color).size(10.0)));
 
                         ui.add_sized([68.0, 16.0], egui::Label::new(
-                            egui::RichText::new(format!("{:.2}", trade.price)).color(egui::Color32::WHITE).size(10.0)));
+                            egui::RichText::new(format_price(trade.price, state.price_decimals)).color(egui::Color32::WHITE).size(10.0)));
 
                         ui.add_sized([52.0, 16.0], egui::Label::new(
-                            egui::RichText::new(format!("{:.4}", trade.qty)).color(egui::Color32::WHITE).size(10.0)));
+                            egui::RichText::new(format_volume(trade.qty)).color(egui::Color32::WHITE).size(10.0)));
 
                         let pnl_color = if trade.realized_pnl >= 0.0 { BID_COLOR } else { ASK_COLOR };
                         ui.add_sized([58.0, 16.0], egui::Label::new(

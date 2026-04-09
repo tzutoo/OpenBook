@@ -443,16 +443,27 @@ pub enum Signal {
 
 ### `StrategyConfig`
 
-All tunable parameters with sensible defaults.
+All tunable parameters. The default uses the 30s preset (`for_30s()`).
 
-| Field | Default | Description |
+| Field | Default (30s) | Description |
 |---|---|---|
-| `bar_duration_ms` | `60_000` | Bar aggregation window |
-| `long_entry_threshold` | `0.5` | Minimum composite score for long entry |
-| `short_entry_threshold` | `-0.5` | Maximum composite score for short entry |
-| `min_absorption_for_reversal` | `0.7` | Absorption must exceed this for reversal entries |
-| `long_exit_threshold` | `-0.2` | Score below this exits long |
-| `short_exit_threshold` | `0.2` | Score above this exits short |
+| `bar_duration_ms` | `30_000` | Bar aggregation window |
+| `long_entry_threshold` | `0.30` | Minimum composite score for long entry |
+| `short_entry_threshold` | `-0.30` | Maximum composite score for short entry |
+| `min_absorption_for_reversal` | `0.45` | Absorption must exceed this for reversal entries |
+| `min_momentum_threshold` | `0.10` | Minimum fill:kill net direction for momentum entries |
+| `absorption_ob_imbalance_threshold` | `0.06` | Minimum OB imbalance to confirm absorption direction |
+| `long_exit_threshold` | `-0.08` | Score below this exits long |
+| `short_exit_threshold` | `0.08` | Score above this exits short |
+| `max_spread_bps` | `15.0` | Maximum average spread (bps) to enter |
+| `min_liquidity_skew_ratio` | `1.05` | Minimum opposite/same-side slippage ratio |
+| `trend_divergence_threshold` | `-0.08` | Maximum adverse OB trend slope |
+| `enforce_macro_trend` | `true` | Require cumulative volume to align with direction |
+| `min_void_levels_for_reversion` | `20` | Minimum levels burst must consume for void entry |
+| `void_price_recovery_pct` | `1.0003` | Price recovery multiplier for void confirmation |
+| `void_ob_imbalance_threshold` | `0.03` | Minimum OB imbalance for void confirmation |
+| `void_spread_tightness_pct` | `0.80` | Spread must be below this fraction of max_spread_bps for void entry |
+| `min_trades_per_sec` | `0.2` | Minimum average trades/sec to enter |
 | `weight_fk_direction` | `0.30` | Weight for fill:kill net direction |
 | `weight_aggression_shift` | `0.25` | Weight for aggression shift |
 | `weight_ob_imbalance` | `0.15` | Weight for order book imbalance |
@@ -460,15 +471,16 @@ All tunable parameters with sensible defaults.
 | `weight_buy_volume_pct` | `0.15` | Weight for buy volume deviation |
 | `risk_per_trade_pct` | `0.5` | Max equity % risked per trade |
 | `max_position_size_usd` | `10_000.0` | Maximum position notional |
-| `stop_loss_pct` | `0.15` | Stop loss as % of position value |
-| `take_profit_pct` | `0.30` | Take profit as % of position value (~2:1 R:R) |
+| `stop_loss_pct` | `0.30` | Stop loss as % of position value |
+| `take_profit_pct` | `0.15` | Take profit as % of position value (~1:2 R:R) |
 | `trailing_stop_activation_pct` | `0.15` | Activate trailing after this profit % |
 | `trailing_stop_distance_pct` | `0.08` | Trailing stop distance from peak |
-| `time_stop_ms` | `180_000` | Exit if no profit after 3 minutes |
+| `time_stop_ms` | `45_000` | Exit if no profit after 45 seconds |
+| `stale_exit_min_bars` | `1` | Minimum bars before allowing stale exit |
 | `max_open_positions` | `1` | Max concurrent positions |
 | `daily_loss_limit_pct` | `3.0` | Halt trading if daily loss exceeds this % |
 | `max_consecutive_losses` | `5` | Halt after this many consecutive losses |
-| `cooldown_after_loss_ms` | `30_000` | Wait before re-entering after a loss |
+| `cooldown_after_loss_ms` | `90_000` | Wait before re-entering after a loss |
 
 ### `StrategyEngine`
 

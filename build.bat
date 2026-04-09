@@ -5,8 +5,8 @@ echo Building OpenBook...
 cargo build --release
 if %ERRORLEVEL% EQU 0 (
     echo.
-    echo Build successful! Run the executable with:
-    echo   target\release\cli_ob.exe
+    echo Build successful! Running OpenBook...
+    target\release\cli_ob.exe
 ) else (
     echo.
     echo Build failed with error code %ERRORLEVEL%

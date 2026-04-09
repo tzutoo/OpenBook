@@ -492,6 +492,7 @@ impl SignalExtractor {
         let cutoff = now_ms.saturating_sub(lookback_ms);
 
         let mut total_volume = 0.0_f64;
+        let mut trade_count = 0u32;
         let mut first_price: Option<f64> = None;
         let mut last_price: Option<f64> = None;
 
@@ -500,11 +501,16 @@ impl SignalExtractor {
                 continue;
             }
             total_volume += trade.price * trade.quantity;
+            trade_count += 1;
             first_price = Some(first_price.unwrap_or(trade.price));
             last_price = Some(trade.price);
         }
 
-        if total_volume < 1e-12 {
+        // Require minimum activity to avoid false positives from low-activity periods
+        const MIN_VOLUME_USD: f64 = 500.0;
+        const MIN_TRADE_COUNT: u32 = 3;
+
+        if total_volume < MIN_VOLUME_USD || trade_count < MIN_TRADE_COUNT {
             return 0.0;
         }
 
@@ -514,8 +520,10 @@ impl SignalExtractor {
         };
 
         if price_change_pct < 1e-6 {
-            // Effectively zero price change with non-zero volume → maximum absorption.
-            return 1.0;
+            // Effectively zero price change with meaningful volume → high absorption.
+            // Scale by volume to differentiate between mild and strong absorption.
+            let volume_factor = (total_volume / MIN_VOLUME_USD).ln().min(1.0);
+            return 0.7 + 0.3 * volume_factor;
         }
 
         // Raw ratio: volume / price_change_pct. Higher = more absorption.
