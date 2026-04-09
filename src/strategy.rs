@@ -650,8 +650,8 @@ impl StrategyConfig {
             // Absorption OB confirmation: more lenient
             absorption_ob_imbalance_threshold: 0.08,
             // Exit: tighter to reduce whipsaw in noisy environment
-            long_exit_threshold: -0.05,
-            short_exit_threshold: 0.05,
+            long_exit_threshold: -0.15,
+            short_exit_threshold: 0.15,
             // Spread: widened from 8.0 to allow entries on more instruments
             max_spread_bps: 12.0,
             // Liquidity skew: relaxed from 1.3
@@ -676,20 +676,20 @@ impl StrategyConfig {
             risk_per_trade_pct: 0.4,
             max_position_size_usd: 10_000.0,
             // Stop loss: tighter for smaller moves
-            stop_loss_pct: 0.20,
+            stop_loss_pct: 0.30,
             // Take profit: smaller target, more achievable
-            take_profit_pct: 0.10,
-            trailing_stop_activation_pct: 0.10,
-            trailing_stop_distance_pct: 0.05,
+            take_profit_pct: 0.30,
+            trailing_stop_activation_pct: 0.15,
+            trailing_stop_distance_pct: 0.08,
             // Time stop: very fast exit (~1.3 bars)
-            time_stop_ms: 20_000,
+            time_stop_ms: 60_000,
             // Stale exit: require 2 bars before allowing early exit
-            stale_exit_min_bars: 2,
+            stale_exit_min_bars: 3,
             max_open_positions: 1,
             daily_loss_limit_pct: 3.0,
             max_consecutive_losses: 5,
             // Cooldown: shortened from 120s to 60s (4 bars)
-            cooldown_after_loss_ms: 60_000,
+            cooldown_after_loss_ms: 120_000,
         }
     }
 
@@ -711,8 +711,8 @@ impl StrategyConfig {
             // Absorption OB confirmation: more lenient
             absorption_ob_imbalance_threshold: 0.06,
             // Exit: slightly tighter reversal exit
-            long_exit_threshold: -0.08,
-            short_exit_threshold: 0.08,
+            long_exit_threshold: -0.20,
+            short_exit_threshold: 0.20,
             // Spread: widened from 10.0 to allow entries on more instruments
             max_spread_bps: 15.0,
             // Liquidity skew: relaxed from 1.2
@@ -737,20 +737,20 @@ impl StrategyConfig {
             risk_per_trade_pct: 0.5,
             max_position_size_usd: 10_000.0,
             // Stop loss: tighter to limit per-trade damage
-            stop_loss_pct: 0.30,
+            stop_loss_pct: 0.40,
             // Take profit: more realistic target
-            take_profit_pct: 0.15,
-            trailing_stop_activation_pct: 0.15,
-            trailing_stop_distance_pct: 0.08,
+            take_profit_pct: 0.40,
+            trailing_stop_activation_pct: 0.20,
+            trailing_stop_distance_pct: 0.10,
             // Time stop: exit faster if trade isn't working (~1.5 bars)
-            time_stop_ms: 45_000,
+            time_stop_ms: 120_000,
             // Stale exit: require 1 bar before allowing early exit
-            stale_exit_min_bars: 1,
+            stale_exit_min_bars: 3,
             max_open_positions: 1,
             daily_loss_limit_pct: 3.0,
             max_consecutive_losses: 5,
             // Cooldown: shortened from 180s to 90s (3 bars)
-            cooldown_after_loss_ms: 90_000,
+            cooldown_after_loss_ms: 180_000,
         }
     }
 
@@ -772,8 +772,8 @@ impl StrategyConfig {
             // Absorption OB confirmation: more lenient
             absorption_ob_imbalance_threshold: 0.05,
             // Exit: slightly wider reversal exit (less whipsaw on 1m)
-            long_exit_threshold: -0.10,
-            short_exit_threshold: 0.10,
+            long_exit_threshold: -0.25,
+            short_exit_threshold: 0.25,
             // Spread: widened from 12.0 to allow entries on more instruments
             max_spread_bps: 18.0,
             // Liquidity skew: relaxed from 1.1 — effectively disabled
@@ -798,20 +798,20 @@ impl StrategyConfig {
             risk_per_trade_pct: 0.6,
             max_position_size_usd: 10_000.0,
             // Stop loss: wider to allow breathing room
-            stop_loss_pct: 0.40,
+            stop_loss_pct: 0.50,
             // Take profit: larger target (moves are bigger)
-            take_profit_pct: 0.20,
-            trailing_stop_activation_pct: 0.20,
-            trailing_stop_distance_pct: 0.10,
+            take_profit_pct: 0.50,
+            trailing_stop_activation_pct: 0.25,
+            trailing_stop_distance_pct: 0.15,
             // Time stop: longer (~1.5 bars)
-            time_stop_ms: 90_000,
+            time_stop_ms: 240_000,
             // Stale exit: require 1 bar before allowing early exit
-            stale_exit_min_bars: 1,
+            stale_exit_min_bars: 3,
             max_open_positions: 1,
             daily_loss_limit_pct: 3.0,
             max_consecutive_losses: 5,
             // Cooldown: shortened from 240s to 120s (2 bars)
-            cooldown_after_loss_ms: 120_000,
+            cooldown_after_loss_ms: 300_000,
         }
     }
 
